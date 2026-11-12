@@ -270,6 +270,7 @@ SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="xxxx", ATTRS{idProduct}=
 
 ## 路线图
 
+- [ ] 跨平台：语音主机与服务端也能部署在 Windows 上（[方案](docs/cross-platform.md)）
 - [ ] 松手后用小 LLM 做整句改写，修正上下文之外的专有名词
 - [ ] Linux 主机 systemd 自启动
 - [ ] 1.7B 模型下的流式延迟复测
@@ -282,7 +283,7 @@ agent/                   单文件 Agent（stdlib only，Linux / Windows 通用�
 scripts/                 Qwen3-ASR 服务、冒烟测试、演示动图渲染
 gui/                     PyQt5 桌面界面
 tests/                   单元测试
-docs/                    架构、协议、实施记录
+docs/                    架构、协议、跨平台方案、实施记录
 ```
 
 运行测试：`PYTHONPATH=src python3 -m unittest discover -s tests`

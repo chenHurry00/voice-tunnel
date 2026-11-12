@@ -40,6 +40,7 @@
 
 ## 下一步
 
+- [ ] 跨平台部署（语音主机 / 服务端支持 Windows）：方案与实测见 [cross-platform.md](cross-platform.md)
 - [ ] 实机确认 Windows 浮窗外观与光标定位（VS Code / Chrome / 记事本 / Windows Terminal）
 - [ ] Linux 三台 systemd 自启动；X99 serve/asr/agent 目前在 tmux（vt-serve / vt-asr / vt-agent）
 
