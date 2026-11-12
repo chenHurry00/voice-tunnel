@@ -95,7 +95,7 @@ DATA_DIR=/home/yuchen/SATA-2/AI/voice-tunnel
 # transformers 后端
 $DATA_DIR/venvs/qwen/bin/python scripts/qwen_asr_service.py \
   --model $DATA_DIR/models/Qwen3-ASR-0.6B --port 8770
-# vLLM 流式后端（端口 8771，显存占用约 35%）
+# vLLM 流式后端（端口 8771；0.6B 显存占比 0.35 够用，1.7B 需要 0.75，自动拉起时取 config.ini 的 qwen_gpu_memory_utilization）
 $DATA_DIR/venvs/qwen-vllm/bin/python scripts/qwen_asr_service.py \
   --model $DATA_DIR/models/Qwen3-ASR-0.6B --port 8771 --backend vllm --gpu-memory-utilization 0.35
 ```

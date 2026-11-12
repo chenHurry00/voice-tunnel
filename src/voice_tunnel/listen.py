@@ -14,7 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .config import VoiceConfig
+from .config import VoiceConfig, has_qwen_weights
+from .itn import normalize_numbers
 
 LOG = logging.getLogger("voice_tunnel.listen")
 
@@ -59,17 +60,20 @@ def ensure_qwen_service(config: VoiceConfig) -> None:
         python = root / ".venv-qwen" / "bin" / "python"
     script = root / "scripts" / "qwen_asr_service.py"
     model = Path(os.path.expanduser(config.model))
-    if not (model / "model.safetensors").exists():
-        model = data_dir / "models" / "Qwen3-ASR-0.6B"
+    if not has_qwen_weights(model):
+        fallback = data_dir / "models" / "Qwen3-ASR-0.6B"
+        LOG.warning("Qwen3-ASR weights not found under %s, falling back to %s", model, fallback)
+        model = fallback
     if not python.exists() or not script.exists():
         raise RuntimeError(f"Qwen3-ASR service unavailable: missing {python} or {script}")
-    if not (model / "model.safetensors").exists():
+    if not has_qwen_weights(model):
         raise RuntimeError(f"Qwen3-ASR weights not found under {model}")
 
     parsed = urllib.parse.urlparse(config.qwen_url)
     port = parsed.port or 8770
     device = "cuda:0" if config.device_type.lower().startswith("cuda") else "cpu"
     log_path = data_dir / "logs" / "qwen-service.log"
+    extra = ["--gpu-memory-utilization", str(config.qwen_gpu_memory_utilization)] if backend == "vllm" else []
     log_path.parent.mkdir(parents=True, exist_ok=True)
     LOG.info("starting Qwen3-ASR service (%s): %s", backend, python)
     with open(log_path, "ab") as log_file:
@@ -87,6 +91,7 @@ def ensure_qwen_service(config: VoiceConfig) -> None:
                 device,
                 "--backend",
                 backend,
+                *extra,
             ],
             stdin=subprocess.DEVNULL,
             stdout=log_file,
@@ -265,6 +270,7 @@ class ASREngine:
         self.model_lock = threading.Lock()
         self.partial_lock = threading.Lock()
         self.stream_id = ""
+        self.context = ""  # 领域上下文，由 VoiceListener 在每次按键时刷新
 
     def load(self) -> None:
         if self.config.backend.lower() in QWEN_BACKENDS:
@@ -286,6 +292,11 @@ class ASREngine:
             LOG.info("loading partial ASR model %s", partial_path)
             self.partial_model = WhisperModel(partial_path, **kwargs)
         LOG.info("ASR ready")
+
+    def _post(self, text: str) -> str:
+        if text and self.config.simplify:
+            text = _to_simplified(text)
+        return normalize_numbers(text)
 
     def streaming(self) -> bool:
         return (
@@ -314,7 +325,10 @@ class ASREngine:
         try:
             result = self._service_post(
                 "/stream/start",
-                {"language": None if self.config.language.lower() in {"", "auto"} else self.config.language},
+                {
+                    "language": None if self.config.language.lower() in {"", "auto"} else self.config.language,
+                    "context": self.context,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             LOG.warning("stream start failed, falling back: %s", exc)
@@ -341,8 +355,7 @@ class ASREngine:
             LOG.warning("stream chunk failed: %s", exc)
             return ""
         text = str(result.get("text", "")).strip()
-        if text and self.config.simplify:
-            text = _to_simplified(text)
+        text = self._post(text)
         return text
 
     def refresh_stream(self) -> str:
@@ -355,8 +368,7 @@ class ASREngine:
             LOG.warning("stream refresh failed: %s", exc)
             return ""
         text = str(result.get("text", "")).strip()
-        if text and self.config.simplify:
-            text = _to_simplified(text)
+        text = self._post(text)
         return text
 
     def close_stream(self) -> None:
@@ -377,6 +389,7 @@ class ASREngine:
             "audio": base64.b64encode(np.asarray(audio, dtype=np.float32).tobytes()).decode("ascii"),
             "sample_rate": self.config.sample_rate,
             "language": None if self.config.language.lower() in {"", "auto"} else self.config.language,
+            "context": self.context,
         }
         result = self._service_post("/transcribe", payload, timeout=120)
         return str(result.get("text", "")).strip()
@@ -384,8 +397,7 @@ class ASREngine:
     def transcribe(self, audio: Any, partial: bool = False) -> str:
         if self.config.backend.lower() in QWEN_BACKENDS:
             text = self._transcribe_qwen(audio)
-            if text and self.config.simplify:
-                text = _to_simplified(text)
+            text = self._post(text)
             return text
         model = self.partial_model if partial and self.partial_model is not None else self.model
         if model is None:
@@ -405,8 +417,7 @@ class ASREngine:
                 compression_ratio_threshold=2.4,
             )
             text = "".join(segment.text for segment in segments).strip()
-        if text and self.config.simplify:
-            text = _to_simplified(text)
+        text = self._post(text)
         return text
 
 
@@ -531,6 +542,16 @@ class VoiceListener:
         except Exception as exc:  # noqa: BLE001
             LOG.warning("resolve target failed: %s", exc)
             return None
+
+    def _asr_context(self) -> str:
+        """通用描述 + 服务端当前在线的设备名（自动获取，不用手填词表）。"""
+        hosts: list[str] = []
+        try:
+            data = self.hud_client.request({"command": "targets"}).get("data") or []
+            hosts = [str(item["host"]) for item in data]
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("fetch hosts for ASR context failed: %s", exc)
+        return self.config.context + ("设备名：" + "、".join(hosts) + "。" if hosts else "")
 
     def _hud(self, event: str, target: str | None = None, **fields: Any) -> None:
         target = target or self.target
@@ -658,6 +679,7 @@ class VoiceListener:
         if not self.target:
             LOG.warning("no active target (pointer on a screen without agent?)")
         self._hud("listen", level=0.0)
+        self.asr.context = self._asr_context()
         self._stream_sent = 0
         self._stream_active = self.config.partial and self.asr.streaming() and self.asr.start_stream()
         if self._stream_active:

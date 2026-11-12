@@ -10,6 +10,12 @@ from pathlib import Path
 DEFAULT_CONFIG = Path("config.ini")
 
 
+def has_qwen_weights(model_dir: str | Path) -> bool:
+    """Qwen3-ASR 权重存在（单文件，或 1.7B 这样的分片 + index）。"""
+    path = Path(model_dir)
+    return (path / "model.safetensors").exists() or (path / "model.safetensors.index.json").exists()
+
+
 @dataclass
 class ServerConfig:
     bind: str = "0.0.0.0"
@@ -18,6 +24,13 @@ class ServerConfig:
     default_target: str | None = "yuchen-X99"
     heartbeat_timeout: float = 15.0
     ack_timeout: float = 5.0
+
+
+# Qwen3-ASR 的系统提示词（领域上下文）；监听端会在后面自动追加在线设备名
+DEFAULT_ASR_CONTEXT = (
+    "程序员日常口述，中英文混合。英文单词、缩写、型号、命令保持原文，"
+    "数字、IP、端口、版本号一律用阿拉伯数字，公式和代码符号保持原样。"
+)
 
 
 @dataclass
@@ -44,6 +57,8 @@ class VoiceConfig:
     min_seconds: float = 0.3
     max_seconds: float = 300.0  # 防止卡键的保护上限，不是句长限制
     download_root: str = ""
+    context: str = DEFAULT_ASR_CONTEXT
+    qwen_gpu_memory_utilization: float = 0.75  # vLLM 自动拉起时的显存占比；1.7B 在 0.55 下 KV 缓存为负，起不来
 
 
 @dataclass
@@ -64,7 +79,7 @@ class AgentConfig:
 
 def _get(parser: configparser.ConfigParser, section: str, key: str, default: str) -> str:
     if parser.has_section(section) and parser.has_option(section, key):
-        return parser.get(section, key)
+        return parser.get(section, key, raw=True)
     return default
 
 
@@ -137,4 +152,6 @@ def load_voice_config(path: str | Path | None = None) -> VoiceConfig:
         min_seconds=float(_get(parser, "voice", "min_seconds", "0.3")),
         max_seconds=float(_get(parser, "voice", "max_seconds", "300")),
         download_root=_get(parser, "voice", "download_root", ""),
+        context=_get(parser, "voice", "context", DEFAULT_ASR_CONTEXT),
+        qwen_gpu_memory_utilization=float(_get(parser, "voice", "qwen_gpu_memory_utilization", "0.75")),
     )

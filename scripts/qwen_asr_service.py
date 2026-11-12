@@ -56,6 +56,13 @@ def normalize_language(value: Any) -> str | None:
     return LANGUAGE_ALIASES.get(text.lower(), text[:1].upper() + text[1:].lower())
 
 
+def echoes_context(text: str, context: str) -> bool:
+    """静音/底噪时模型会把系统提示词原样吐出来，这不是识别结果（长度门槛避免误伤说出的短词）。"""
+    text = "".join(text.split())
+    context = "".join(context.split())
+    return len(text) >= 8 and text[:8] in context
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="~/.cache/voice-tunnel/models/Qwen3-ASR-0.6B")
@@ -154,10 +161,13 @@ def main() -> int:
             audio = self._pcm(payload)
             sample_rate = int(payload.get("sample_rate", 16000))
             language = normalize_language(payload.get("language"))
+            context = str(payload.get("context") or "")
             with lock:
-                results = model.transcribe(audio=(audio, sample_rate), language=language)
+                results = model.transcribe(audio=(audio, sample_rate), context=context, language=language)
             result = results[0] if results else None
             text = getattr(result, "text", "") if result is not None else ""
+            if echoes_context(text, context):
+                text = ""
             lang = getattr(result, "language", None) if result is not None else None
             return {"ok": True, "text": text, "language": lang}
 
@@ -166,12 +176,13 @@ def main() -> int:
                 raise RuntimeError("streaming requires the vllm backend")
             language = normalize_language(payload.get("language"))
             # 只借用库的 prompt 构造；增量解码由本服务自己调度（见 _stream_chunk）
-            state = model.init_streaming_state(language=language)
+            context = str(payload.get("context") or "")
+            state = model.init_streaming_state(context=context, language=language)
             now = time.time()
             for sid in [k for k, v in sessions.items() if now - v["created"] > SESSION_TTL_SEC]:
                 sessions.pop(sid, None)
             session_id = uuid.uuid4().hex
-            sessions[session_id] = {"state": state, "created": now, "decoded": 0, "committed": ""}
+            sessions[session_id] = {"state": state, "created": now, "decoded": 0, "committed": "", "context": context}
             LOG.info("stream start %s (language=%s)", session_id, language)
             return {"ok": True, "session_id": session_id}
 
@@ -202,6 +213,8 @@ def main() -> int:
             outputs = model.model.generate([inp], sampling_params=model.sampling_params, use_tqdm=False)
             state._raw_decoded = prefix + outputs[0].outputs[0].text
             state.language, state.text = parse_asr_output(state._raw_decoded, user_language=state.force_language)
+            if echoes_context(state.text, entry["context"]):
+                state._raw_decoded, state.text = "", ""
             entry["decoded"] = audio.shape[0]
 
         def _stream_chunk(self, payload: dict[str, Any]) -> dict[str, Any]:

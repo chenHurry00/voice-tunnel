@@ -20,6 +20,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 APP_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_DIR / "src"))
+from voice_tunnel.config import has_qwen_weights  # noqa: E402
 from voice_tunnel.control import ControlClient  # noqa: E402  (stdlib-only，可在系统 Python 下导入)
 
 CONFIG = APP_DIR / "config.ini"
@@ -46,7 +47,7 @@ def list_models(backend: str = "whisper", data_dir: str = DEFAULT_DATA_DIR) -> l
         name = directory.name
         is_qwen = name.startswith("Qwen3-ASR-")
         if backend == "qwen3":
-            if not is_qwen or not (directory / "model.safetensors").exists():
+            if not is_qwen or not has_qwen_weights(directory):
                 continue
             label = "Qwen3-ASR " + name[len("Qwen3-ASR-") :]
         else:
