@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+*.log
+*.wav
+config.ini
+agent.ini
+.DS_Store

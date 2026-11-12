@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-tunnel"
+version = "0.1.0"
+description = "Centralized ASR + per-host text injection for multi-machine vibe coding"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "yuchen" }]
+dependencies = []
+
+[project.optional-dependencies]
+voice = [
+    "faster-whisper>=1.0",
+    "sounddevice>=0.4",
+    "evdev>=1.6",
+    "numpy>=1.21",
+    "zhconv>=1.4",
+]
+
+[project.scripts]
+voice-tunnel = "voice_tunnel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
