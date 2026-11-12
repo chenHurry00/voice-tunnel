@@ -10,9 +10,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import ServerConfig
-from .protocol import PROTOCOL_VERSION, ProtocolError, new_request_id, read_message, write_message
+from .protocol import PROTOCOL_VERSION, ProtocolError, encode_message, new_request_id, read_message, write_message
 
 LOG = logging.getLogger("voice_tunnel.server")
+
+# Deskflow 在 Windows 上常出现 leave→enter 抖动（数百毫秒内），leave 后保留原目标一小段时间
+LEAVE_GRACE_SEC = 1.5
+HUD_EVENTS = {"listen", "level", "partial", "finish", "commit", "error", "hide"}
 
 
 @dataclass
@@ -30,6 +34,8 @@ class TunnelServer:
         self.agents: dict[str, AgentConnection] = {}
         self.pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.active_host: str | None = None
+        self.left_at = 0.0  # active_host 发出 leave 的时刻；0 表示仍在该主机上
+        self.seen_event = False  # 收到过任何切屏事件后，目标未知时不再回退 default_target
         self.manual_host: str | None = None
         self.manual_until: float = 0.0
         self._server: asyncio.AbstractServer | None = None
@@ -49,18 +55,17 @@ class TunnelServer:
 
     async def _reaper(self) -> None:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             now = time.time()
             if self.manual_host and now >= self.manual_until:
                 LOG.info("manual target expired: %s", self.manual_host)
                 self.manual_host = None
                 self.manual_until = 0.0
             for host, conn in list(self.agents.items()):
-                if conn.active and now - conn.last_seen > self.config.heartbeat_timeout:
-                    LOG.warning("agent %s heartbeat timeout", host)
-                    conn.active = False
-                    if self.active_host == host:
-                        self.active_host = None
+                # Agent 每 3s 发心跳；长时间无消息说明连接已死（休眠/断网），主动断开让其重连
+                if now - conn.last_seen > self.config.heartbeat_timeout:
+                    LOG.warning("agent %s silent for %.0fs, dropping connection", host, now - conn.last_seen)
+                    conn.writer.close()
 
     # ------------------------------------------------------------------ connection
 
@@ -98,12 +103,12 @@ class TunnelServer:
         except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
-            if role == "agent" and host in self.agents:
-                conn = self.agents.pop(host)
-                if conn.writer is writer:
-                    LOG.info("agent disconnected: %s", host)
-                    if self.active_host == host:
-                        self.active_host = None
+            conn = self.agents.get(host) if role == "agent" else None
+            # 只清理属于本连接的登记；重连时旧连接的收尾不能删掉新连接
+            if conn is not None and conn.writer is writer:
+                # 不清 active_host：Agent 重启/断网重连后鼠标多半还在这台机器上，重连即恢复
+                del self.agents[host]
+                LOG.info("agent disconnected: %s", host)
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -117,7 +122,11 @@ class TunnelServer:
             old.writer.close()
         conn = AgentConnection(host=host, reader=reader, writer=writer)
         self.agents[host] = conn
-        LOG.info("agent connected: %s", host)
+        LOG.info("agent connected: %s %s", host, writer.get_extra_info("peername"))
+        if self.active_host == host and not self.left_at:
+            # 重启后的 Agent 不知道自己是当前屏幕，告诉它恢复活跃（继续发活跃心跳）
+            conn.active = True
+            self._push(conn, {"type": "active_state", "active": True})
 
         while True:
             message = await read_message(reader)
@@ -131,24 +140,88 @@ class TunnelServer:
                 if future is not None and not future.done():
                     future.set_result(message)
             elif kind == "active":
-                state = message.get("state")
-                conn.active = state == "enter"
-                if conn.active:
-                    self.active_host = host
-                    LOG.info("active target -> %s", host)
-                elif self.active_host == host:
-                    self.active_host = None
-                    LOG.info("active target cleared (left %s)", host)
+                if message.get("state") == "enter":
+                    self._on_enter(conn)
+                else:
+                    self._on_leave(conn)
             elif kind == "heartbeat":
-                if bool(message.get("active")):
-                    conn.active = True
-                    if self.active_host is None and self.manual_host is None:
-                        # recover from a lost enter event only when nothing else is active
-                        self.active_host = host
+                self._on_heartbeat(conn, bool(message.get("active")))
+                self._push(conn, {"type": "pong", "ts": time.time()})
             elif kind == "ping":
-                await write_message(writer, {"type": "pong", "ts": time.time()})
+                self._push(conn, {"type": "pong", "ts": time.time()})
             else:
                 LOG.debug("agent %s: ignored %s", host, kind)
+
+    # ------------------------------------------------------------------ active target
+
+    def _on_enter(self, conn: AgentConnection) -> None:
+        self.seen_event = True
+        conn.active = True
+        if self.active_host != conn.host or self.left_at:
+            LOG.info("active target -> %s", conn.host)
+        self.active_host = conn.host
+        self.left_at = 0.0
+        # 同一时刻只有一个鼠标：其他自认为活跃的 Agent（丢了 leave 事件）一律失活
+        for other in self.agents.values():
+            if other is not conn and other.active:
+                other.active = False
+                self._push(other, {"type": "active_state", "active": False})
+
+    def _on_leave(self, conn: AgentConnection) -> None:
+        self.seen_event = True
+        conn.active = False
+        if self.active_host == conn.host and not self.left_at:
+            self.left_at = time.time()
+            LOG.info("left %s", conn.host)
+
+    def _on_heartbeat(self, conn: AgentConnection, active: bool) -> None:
+        if not active:
+            conn.active = False
+            return
+        if self.active_host == conn.host and not self.left_at:
+            conn.active = True
+            return
+        if self.current_target() is None:
+            LOG.info("recovered active target from heartbeat: %s", conn.host)
+            self._on_enter(conn)
+        else:
+            # 另一台主机已是目标：这台是丢了 leave 的僵尸活跃状态
+            conn.active = False
+            self._push(conn, {"type": "active_state", "active": False})
+
+    def current_target(self) -> str | None:
+        now = time.time()
+        if self.manual_host and now < self.manual_until:
+            return self.manual_host
+        host = self.active_host
+        if host and host in self.agents and (not self.left_at or now - self.left_at < LEAVE_GRACE_SEC):
+            return host
+        if not self.seen_event:
+            return self.config.default_target
+        return None  # 鼠标在没有 Agent 的屏幕上，或目标 Agent 不在线：不猜
+
+    def _resolve(self, target: str | None) -> AgentConnection:
+        name = str(target or "active")
+        resolved = self.current_target() if name == "active" else name
+        if not resolved:
+            raise ValueError("no active target")
+        conn = self.agents.get(resolved)
+        if conn is None:
+            raise ValueError(f"agent not connected: {resolved}")
+        return conn
+
+    def _push(self, conn: AgentConnection, message: dict[str, Any]) -> None:
+        """非阻塞发送；对端卡死导致写缓冲堆积时断开，交给重连恢复。"""
+        try:
+            conn.writer.write(encode_message(message))
+            transport = conn.writer.transport
+            if transport is not None and transport.get_write_buffer_size() > 512 * 1024:
+                LOG.warning("agent %s write buffer full, dropping connection", conn.host)
+                conn.writer.close()
+        except (ConnectionError, RuntimeError) as exc:
+            LOG.debug("push to %s failed: %s", conn.host, exc)
+
+    # ------------------------------------------------------------------ control
 
     async def _control_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         while True:
@@ -169,14 +242,27 @@ class TunnelServer:
 
     async def _dispatch_control(self, command: str, message: dict[str, Any]) -> Any:
         if command == "send":
-            target = str(message.get("target") or "active")
             text = str(message.get("text", ""))
             if not text:
                 raise ValueError("text is empty")
             if len(text) > 20_000:
                 raise ValueError("text too long")
-            conn = await self.send_text(target, text)
-            return {"target": target, "request_id": conn.get("request_id"), "ack": conn}
+            conn = self._resolve(message.get("target"))
+            ack = await self.send_text(conn, text)
+            return {"target": conn.host, "request_id": ack.get("request_id"), "ack": ack}
+        if command == "resolve":
+            return {"target": self.current_target()}
+        if command == "hud":
+            event = str(message.get("event", ""))
+            if event not in HUD_EVENTS:
+                raise ValueError(f"unknown hud event: {event}")
+            conn = self._resolve(message.get("target"))
+            payload: dict[str, Any] = {"type": "hud", "event": event}
+            for key in ("text", "stable", "level"):
+                if key in message:
+                    payload[key] = message[key]
+            self._push(conn, payload)
+            return {"target": conn.host}
         if command == "targets":
             return [self._agent_info(c) for c in self.agents.values()]
         if command == "status":
@@ -187,20 +273,6 @@ class TunnelServer:
                 "manual_host": self.manual_host,
                 "agents": [self._agent_info(c) for c in self.agents.values()],
             }
-        if command in {"preview", "final"}:
-            target = str(message.get("target") or "active")
-            text = str(message.get("text", ""))
-            resolved = self.current_target() if target == "active" else target
-            if not resolved:
-                raise ValueError("no active target")
-            conn = self.agents.get(resolved)
-            if conn is None:
-                raise ValueError(f"agent not connected: {resolved}")
-            payload = {"type": "partial" if command == "preview" else command, "text": text}
-            if command == "preview":
-                payload["stable_len"] = int(message.get("stable_len", -1))
-            await write_message(conn.writer, payload)
-            return {"target": resolved, "sent": True}
         if command == "set_target":
             host = message.get("host")
             if host:
@@ -223,32 +295,16 @@ class TunnelServer:
             "last_seen": round(time.time() - conn.last_seen, 1),
         }
 
-    def current_target(self) -> str | None:
-        if self.manual_host and time.time() < self.manual_until:
-            return self.manual_host
-        return self.active_host or self.config.default_target
-
-    async def send_text(self, target: str, text: str) -> dict[str, Any]:
-        if target == "active":
-            resolved = self.current_target()
-            if not resolved:
-                raise ValueError("no active target")
-            target = resolved
-        conn = self.agents.get(target)
-        if conn is None:
-            raise ValueError(f"agent not connected: {target}")
+    async def send_text(self, conn: AgentConnection, text: str) -> dict[str, Any]:
         request_id = new_request_id()
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
-        await write_message(
-            conn.writer,
-            {"type": "insert_text", "request_id": request_id, "text": text, "created_at": time.time()},
-        )
+        self._push(conn, {"type": "insert_text", "request_id": request_id, "text": text, "created_at": time.time()})
         try:
             ack = await asyncio.wait_for(future, timeout=self.config.ack_timeout)
         except asyncio.TimeoutError as exc:
             self.pending.pop(request_id, None)
-            raise ValueError(f"agent {target} did not ack within {self.config.ack_timeout}s") from exc
+            raise ValueError(f"agent {conn.host} did not ack within {self.config.ack_timeout}s") from exc
         if not ack.get("ok"):
-            raise ValueError(f"agent {target} rejected text: {ack.get('error')}")
+            raise ValueError(f"agent {conn.host} rejected text: {ack.get('error')}")
         return {"request_id": request_id, **ack}

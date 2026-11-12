@@ -39,6 +39,8 @@ sleep 2
 
 PYTHONPATH=src python3 -m voice_tunnel.cli --config "$TMP/config.ini" send \
   --target yuchen-X99 --text "smoke 中文 123"
+PYTHONPATH=src python3 -m voice_tunnel.cli --config "$TMP/config.ini" preview \
+  --target yuchen-X99 --text "预览 hud"
 PYTHONPATH=src python3 -m voice_tunnel.cli --config "$TMP/config.ini" status
 
 grep -q "dry-run inject" "$TMP/agent.log"

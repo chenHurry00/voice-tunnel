@@ -8,7 +8,6 @@ Run with the system Python that has python3-pyqt5 installed:
 from __future__ import annotations
 
 import configparser
-import json
 import os
 import re
 import subprocess
@@ -20,6 +19,9 @@ from typing import Any
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 APP_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(APP_DIR / "src"))
+from voice_tunnel.control import ControlClient  # noqa: E402  (stdlib-only，可在系统 Python 下导入)
+
 CONFIG = APP_DIR / "config.ini"
 CLI = APP_DIR / ".venv" / "bin" / "voice-tunnel"
 DEFAULT_DATA_DIR = "~/.cache/voice-tunnel"
@@ -99,33 +101,24 @@ def list_mics() -> list[str]:
 class StatusWorker(QtCore.QThread):
     updated = QtCore.pyqtSignal(dict)
 
-    def __init__(self, cli: Path, config: Path) -> None:
+    def __init__(self, config: Path) -> None:
         super().__init__()
-        self.cli = cli
-        self.config = config
+        self.client = ControlClient(str(config), timeout=2)
         self._stop = False
 
     def run(self) -> None:
         while not self._stop:
-            data: dict[str, Any] = {}
             try:
-                result = subprocess.run(
-                    [str(self.cli), "--config", str(self.config), "status"],
-                    capture_output=True,
-                    text=True,
-                    timeout=6,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    data = json.loads(result.stdout)
-                else:
-                    data = {"error": (result.stderr or "status failed").strip()}
+                result = self.client.request({"command": "status"})
+                data = result.get("data") if result.get("ok") else {"error": result.get("error")}
             except Exception as exc:  # noqa: BLE001
                 data = {"error": str(exc)}
-            self.updated.emit(data)
-            for _ in range(30):
+            self.updated.emit(data or {})
+            for _ in range(15):
                 if self._stop:
-                    return
+                    break
                 time.sleep(0.1)
+        self.client.close()
 
     def stop(self) -> None:
         self._stop = True
@@ -135,9 +128,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Voice Tunnel")
-        self.setMinimumSize(860, 560)
-        self.resize(980, 640)
-        self.setWindowIcon(make_icon("#2563eb"))
+        self.setMinimumSize(780, 480)
+        self.resize(860, 540)
+        self.setWindowIcon(make_icon("#1f2329"))
         self.settings = QtCore.QSettings("voice-tunnel", "gui")
         self.proc: QtCore.QProcess | None = None
         self.worker: StatusWorker | None = None
@@ -162,26 +155,20 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QWidget(objectName="Root")
         self.setCentralWidget(root)
         outer = QtWidgets.QVBoxLayout(root)
-        outer.setContentsMargins(18, 16, 18, 16)
-        outer.setSpacing(12)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
 
+        # 状态行：圆点 + 状态 + 当前目标
         header = QtWidgets.QHBoxLayout()
-        titles = QtWidgets.QVBoxLayout()
-        title = QtWidgets.QLabel("Voice Tunnel")
-        title.setObjectName("Title")
-        subtitle = QtWidgets.QLabel("多主机语音输入 · X99 语音主机")
-        subtitle.setObjectName("Subtitle")
-        titles.addWidget(title)
-        titles.addWidget(subtitle)
-        header.addLayout(titles)
+        header.setSpacing(8)
+        self.status_dot = QtWidgets.QLabel(objectName="Dot")
+        self.status_dot.setFixedSize(8, 8)
+        self.status_label = QtWidgets.QLabel("已停止", objectName="Status")
+        self.target_label = QtWidgets.QLabel("", objectName="Muted")
+        header.addWidget(self.status_dot)
+        header.addWidget(self.status_label)
         header.addStretch(1)
-        self.badge = QtWidgets.QLabel("已停止")
-        self.badge.setObjectName("Badge")
-        self.badge.setAlignment(QtCore.Qt.AlignCenter)
-        self.badge.setFixedHeight(30)
-        self.badge.setMinimumWidth(82)
-        self.badge.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        header.addWidget(self.badge)
+        header.addWidget(self.target_label)
         outer.addLayout(header)
 
         body = QtWidgets.QHBoxLayout()
@@ -189,29 +176,26 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.addLayout(body, 1)
 
         left = QtWidgets.QVBoxLayout()
-        left.setSpacing(12)
+        left.setSpacing(10)
         body.addLayout(left, 0)
 
-        settings_box = QtWidgets.QGroupBox("语音设置")
-        settings_box.setMinimumWidth(390)
-        settings_box.setMaximumWidth(430)
-        form = QtWidgets.QFormLayout(settings_box)
-        form.setLabelAlignment(QtCore.Qt.AlignRight)
+        form_box = QtWidgets.QFrame(objectName="Panel")
+        form_box.setFixedWidth(360)
+        form = QtWidgets.QFormLayout(form_box)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(9)
+        form.setVerticalSpacing(8)
 
         self.ptt_key = "KEY_RIGHTCTRL"
         self.ptt_button = QtWidgets.QPushButton(pretty_key(self.ptt_key))
-        self.ptt_button.setObjectName("Secondary")
-        self.ptt_button.setToolTip("点击后按下要作为 PTT 的键")
+        self.ptt_button.setToolTip("点击后按下要作为按住说话的键")
         self.ptt_button.clicked.connect(self._capture_ptt_key)
-        form.addRow("PTT 键", self.ptt_button)
+        form.addRow("说话键", self.ptt_button)
 
         mic_row = QtWidgets.QHBoxLayout()
         self.mic_combo = QtWidgets.QComboBox()
-        self.mic_combo.setEditable(False)
-        mic_refresh = QtWidgets.QPushButton("刷新")
-        mic_refresh.setObjectName("Secondary")
+        mic_refresh = QtWidgets.QToolButton(text="刷新")
         mic_refresh.clicked.connect(self._refresh_mics)
         mic_row.addWidget(self.mic_combo, 1)
         mic_row.addWidget(mic_refresh)
@@ -222,26 +206,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backend_combo.currentTextChanged.connect(self._backend_changed)
         form.addRow("识别后端", self.backend_combo)
 
-        data_row = QtWidgets.QHBoxLayout()
-        self.data_edit = QtWidgets.QLineEdit()
-        self.data_edit.setPlaceholderText("模型/环境/日志的存放目录")
-        self.data_edit.editingFinished.connect(lambda: self._refresh_models())
-        data_browse = QtWidgets.QPushButton("浏览")
-        data_browse.setObjectName("Secondary")
-        data_browse.clicked.connect(self._pick_data_dir)
-        data_row.addWidget(self.data_edit, 1)
-        data_row.addWidget(data_browse)
-        form.addRow("安装位置", data_row)
-
         model_row = QtWidgets.QHBoxLayout()
         self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.setEditable(False)
-        model_refresh = QtWidgets.QPushButton("刷新")
-        model_refresh.setObjectName("Secondary")
+        model_refresh = QtWidgets.QToolButton(text="刷新")
         model_refresh.clicked.connect(self._refresh_models)
         model_row.addWidget(self.model_combo, 1)
         model_row.addWidget(model_refresh)
-        form.addRow("识别模型", model_row)
+        form.addRow("模型", model_row)
 
         self.device_combo = QtWidgets.QComboBox()
         self.device_combo.addItems(["GPU (float16)", "CPU (int8)"])
@@ -252,86 +223,93 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("目标主机", self.target_combo)
 
         preview_row = QtWidgets.QHBoxLayout()
-        self.partial_check = QtWidgets.QCheckBox("说话中预览")
+        self.partial_check = QtWidgets.QCheckBox("边说边显示")
         self.partial_check.setChecked(True)
         self.interval_spin = QtWidgets.QDoubleSpinBox()
         self.interval_spin.setRange(0.3, 2.0)
         self.interval_spin.setSingleStep(0.1)
         self.interval_spin.setDecimals(1)
         self.interval_spin.setSuffix(" s")
+        self.interval_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.interval_spin.setFixedWidth(64)
         preview_row.addWidget(self.partial_check)
         preview_row.addStretch(1)
         preview_row.addWidget(self.interval_spin)
-        form.addRow("预览刷新", preview_row)
+        form.addRow("实时字幕", preview_row)
 
-        left.addWidget(settings_box)
+        data_row = QtWidgets.QHBoxLayout()
+        self.data_edit = QtWidgets.QLineEdit()
+        self.data_edit.setPlaceholderText("模型 / 环境 / 日志目录")
+        self.data_edit.editingFinished.connect(lambda: self._refresh_models())
+        data_browse = QtWidgets.QToolButton(text="…")
+        data_browse.clicked.connect(self._pick_data_dir)
+        data_row.addWidget(self.data_edit, 1)
+        data_row.addWidget(data_browse)
+        form.addRow("数据目录", data_row)
+        left.addWidget(form_box)
 
         buttons = QtWidgets.QHBoxLayout()
         self.save_btn = QtWidgets.QPushButton("保存并应用")
-        self.save_btn.setObjectName("Secondary")
         self.save_btn.clicked.connect(self._save_clicked)
-        self.start_btn = QtWidgets.QPushButton("开始监听")
-        self.start_btn.clicked.connect(self.start_listener)
-        self.stop_btn = QtWidgets.QPushButton("停止监听")
-        self.stop_btn.setObjectName("Secondary")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_listener)
-        self.start_btn.setToolTip("开始监听（Ctrl+R）")
-        self.stop_btn.setToolTip("停止监听（Ctrl+T）")
+        self.run_btn = QtWidgets.QPushButton("开始监听", objectName="Primary")
+        self.run_btn.setToolTip("开始 Ctrl+R / 停止 Ctrl+T")
+        self.run_btn.clicked.connect(lambda: self.stop_listener() if self._running_or_loading() else self.start_listener())
         buttons.addWidget(self.save_btn)
         buttons.addStretch(1)
-        buttons.addWidget(self.start_btn)
-        buttons.addWidget(self.stop_btn)
+        buttons.addWidget(self.run_btn)
         left.addLayout(buttons)
+        left.addStretch(1)
 
         start_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+R"), self)
         start_shortcut.activated.connect(self.start_listener)
         stop_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+T"), self)
         stop_shortcut.activated.connect(self.stop_listener)
-        left.addStretch(1)
 
         right = QtWidgets.QVBoxLayout()
-        right.setSpacing(10)
+        right.setSpacing(6)
         body.addLayout(right, 1)
 
-        log_box = QtWidgets.QGroupBox("运行日志")
-        log_layout = QtWidgets.QVBoxLayout(log_box)
-        self.log = QtWidgets.QPlainTextEdit()
+        right.addWidget(QtWidgets.QLabel("主机", objectName="Section"))
+        self.hosts = QtWidgets.QTreeWidget(objectName="Panel")
+        self.hosts.setColumnCount(2)
+        self.hosts.setHeaderHidden(True)
+        self.hosts.setRootIsDecorated(False)
+        self.hosts.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.hosts.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.hosts.setFixedHeight(118)
+        self.hosts.header().setStretchLastSection(False)
+        self.hosts.header().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.hosts.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        right.addWidget(self.hosts)
+
+        right.addSpacing(4)
+        right.addWidget(QtWidgets.QLabel("日志", objectName="Section"))
+        self.log = QtWidgets.QPlainTextEdit(objectName="Log")
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
-        log_layout.addWidget(self.log)
-        right.addWidget(log_box, 1)
-
-        footer = QtWidgets.QHBoxLayout()
-        self.target_label = QtWidgets.QLabel("目标：yuchen-X99")
-        self.agents_label = QtWidgets.QLabel("Agents：—")
-        self.target_label.setObjectName("Footer")
-        self.agents_label.setObjectName("Footer")
-        footer.addWidget(self.target_label)
-        footer.addStretch(1)
-        footer.addWidget(self.agents_label)
-        right.addLayout(footer)
+        right.addWidget(self.log, 1)
 
         self.setStyleSheet(
             """
-            QWidget { font-family: "Noto Sans CJK SC", "Microsoft YaHei UI"; font-size: 10.5pt; color: #1f2937; }
-            QWidget#Root { background: #f4f6fb; }
-            QLabel#Title { font-size: 21pt; font-weight: 700; color: #111827; }
-            QLabel#Subtitle { color: #6b7280; font-size: 9.5pt; }
-            QLabel#Badge { background: #e5e7eb; color: #4b5563; border-radius: 15px; padding: 0 12px; font-weight: 600; }
-            QLabel#Footer { color: #6b7280; font-size: 9pt; }
-            QGroupBox { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; margin-top: 12px; padding: 14px 12px 12px 12px; font-weight: 600; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #2563eb; }
-            QLineEdit, QComboBox, QDoubleSpinBox { background: #ffffff; border: 1px solid #d1d5db; border-radius: 6px; padding: 5px 8px; min-height: 24px; }
-            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border: 1px solid #2563eb; }
-            QComboBox::drop-down { border: none; width: 22px; }
-            QPushButton { background: #2563eb; color: #ffffff; border: none; border-radius: 6px; padding: 7px 14px; font-weight: 600; }
-            QPushButton:hover { background: #1d4ed8; }
-            QPushButton:disabled { background: #c7d2fe; color: #eef2ff; }
-            QPushButton#Secondary { background: #eef2ff; color: #1d4ed8; }
-            QPushButton#Secondary:hover { background: #e0e7ff; }
-            QPlainTextEdit { background: #0f172a; color: #dbeafe; border: none; border-radius: 8px; padding: 8px; font-family: "JetBrains Mono", "Noto Sans Mono", monospace; font-size: 9.5pt; }
-            QCheckBox { spacing: 6px; }
+            QWidget { font-family: "Noto Sans CJK SC", "Microsoft YaHei UI"; font-size: 10pt; color: #1f2329; }
+            QWidget#Root { background: #f5f6f7; }
+            QLabel#Status { font-weight: 600; }
+            QLabel#Muted { color: #646a73; }
+            QLabel#Section { color: #646a73; font-size: 9pt; }
+            QFrame#Panel, QTreeWidget#Panel { background: #ffffff; border: 1px solid #dee0e3; border-radius: 6px; }
+            QTreeWidget#Panel::item { padding: 3px 4px; }
+            QLineEdit, QComboBox, QDoubleSpinBox { background: #ffffff; border: 1px solid #d0d3d6; border-radius: 4px; padding: 3px 6px; min-height: 22px; }
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border-color: #8f959e; }
+            QLineEdit:disabled, QComboBox:disabled, QDoubleSpinBox:disabled { color: #b4b9c1; background: #f5f6f7; }
+            QComboBox::drop-down { border: none; width: 18px; }
+            QPushButton, QToolButton { background: #ffffff; border: 1px solid #d0d3d6; border-radius: 4px; padding: 4px 12px; min-height: 20px; }
+            QToolButton { padding: 3px 8px; min-height: 18px; }
+            QPushButton:hover, QToolButton:hover { background: #f2f3f5; }
+            QPushButton:pressed, QToolButton:pressed { background: #e8e9eb; }
+            QPushButton#Primary { background: #1f2329; color: #ffffff; border-color: #1f2329; font-weight: 600; padding: 4px 16px; }
+            QPushButton#Primary:hover { background: #373c43; }
+            QPlainTextEdit#Log { background: #ffffff; border: 1px solid #dee0e3; border-radius: 6px; padding: 4px;
+                                 font-family: "JetBrains Mono", "Noto Sans Mono", monospace; font-size: 9pt; color: #373c43; }
             """
         )
 
@@ -379,6 +357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.interval_spin.setValue(float(section.get("partial_interval", "0.5")))
         target = section.get("target", "active")
         self._set_target_selection(target)
+        self._sync_interval_enabled()
 
     def _backend_kind(self) -> tuple[str, str]:
         text = self.backend_combo.currentText()
@@ -433,7 +412,7 @@ class MainWindow(QtWidgets.QMainWindow):
         section["partial_interval"] = f"{self.interval_spin.value():.1f}"
         section["target"] = "active" if self.target_combo.currentIndex() == 0 else self.target_combo.currentText()
         section["min_seconds"] = section.get("min_seconds", "0.3")
-        section["max_seconds"] = section.get("max_seconds", "30")
+        section["max_seconds"] = section.get("max_seconds", "300")
         try:
             with CONFIG.open("w", encoding="utf-8") as handle:
                 parser.write(handle)
@@ -449,8 +428,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         backend, qwen_backend = self._backend_kind()
         self.model_path = self._default_model(backend)
-        self.interval_spin.setValue(0.5 if qwen_backend == "vllm" else (0.8 if backend == "qwen3" else 0.5))
+        self.interval_spin.setValue(0.8 if backend == "qwen3" and qwen_backend != "vllm" else 0.5)
+        self._sync_interval_enabled()
         self._refresh_models()
+
+    def _sync_interval_enabled(self) -> None:
+        streaming = self._backend_kind() == ("qwen3", "vllm")
+        self.interval_spin.setEnabled(not streaming)
+        self.interval_spin.setToolTip("流式后端自动约 0.2s 刷新一次" if streaming else "两次预览解码的间隔")
 
     def _refresh_models(self) -> None:
         backend, _qwen_backend = self._backend_kind()
@@ -577,9 +562,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.proc.finished.connect(self._process_finished)
         self.proc.errorOccurred.connect(self._process_error)
         self.proc.start()
-        self._set_running(False, "加载中", "#f59e0b")
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._set_running(False, "正在加载模型…", "#d29922")
 
     def stop_listener(self) -> None:
         if self.proc is None or self.proc.state() == QtCore.QProcess.NotRunning:
@@ -597,11 +580,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         text = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
         self._append(text.rstrip())
+        try:  # 同步落盘，便于事后排查（窗口日志关掉就没了）
+            log_dir = Path(os.path.expanduser(self.data_edit.text().strip() or DEFAULT_DATA_DIR)) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "listen.log", "a", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError:
+            pass
         if "voice listener ready" in text:
-            self._set_running(True, "运行中", "#16a34a")
+            self._set_running(True)
         if "another voice-tunnel listener" in text:
             self._append("已有监听器在运行，请先停止旧的监听器。")
-            self._set_running(False, "已停止", "#9ca3af")
+            self._set_running(False)
 
     def _process_finished(self, code: int, status: QtCore.QProcess.ExitStatus) -> None:
         self._append(f"监听进程已退出（code={code}）")
@@ -611,56 +601,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append(f"监听进程错误：{error}")
         self._set_running(False)
 
+    def _running_or_loading(self) -> bool:
+        return self.proc is not None and self.proc.state() != QtCore.QProcess.NotRunning
+
     def _set_running(self, running: bool, text: str | None = None, color: str | None = None) -> None:
         if running:
-            label, color = "运行中", "#dcfce7"
-            text_color = "#166534"
+            label, color = f"监听中 · 按住 {pretty_key(self.ptt_key)} 说话", "#2ea043"
         else:
-            label = text or "已停止"
-            color = color or "#e5e7eb"
-            text_color = "#4b5563"
-        self.badge.setText(label)
-        self.badge.setStyleSheet(
-            f"background:{color}; color:{text_color}; border-radius:11px; padding:4px 12px; font-weight:600;"
-        )
-        self.start_btn.setEnabled(not running)
-        self.stop_btn.setEnabled(running)
-        self.tray_start.setEnabled(not running)
-        self.tray_stop.setEnabled(running)
-        self.tray.setIcon(make_icon("#16a34a" if running else "#9ca3af"))
-        self.tray.setToolTip("Voice Tunnel · " + ("运行中" if running else label))
+            label, color = text or "已停止", color or "#b4b9c1"
+        self.status_label.setText(label)
+        self.status_dot.setStyleSheet(f"background:{color}; border-radius:4px;")
+        busy = running or self._running_or_loading()
+        self.run_btn.setText("停止监听" if busy else "开始监听")
+        self.tray_start.setEnabled(not busy)
+        self.tray_stop.setEnabled(busy)
+        self.tray.setIcon(make_icon("#2ea043" if running else "#8f959e"))
+        self.tray.setToolTip("Voice Tunnel · " + ("监听中" if running else label))
 
     # ------------------------------------------------------------------ status
 
     def _start_status_worker(self) -> None:
-        if not CLI.exists():
-            return
-        self.worker = StatusWorker(CLI, CONFIG)
+        self.worker = StatusWorker(CONFIG)
         self.worker.updated.connect(self._on_status)
         self.worker.start()
 
     def _on_status(self, data: dict[str, Any]) -> None:
         if data.get("error"):
-            self.target_label.setText("目标：服务端未连接")
-            self.agents_label.setText("Agents：0")
+            self.target_label.setText("服务端未连接")
+            self.hosts.clear()
             return
-        active = data.get("active_target") or "未知"
-        default = data.get("default_target")
-        self.target_label.setText(f"目标：{active}" + (f"（默认 {default}）" if default and active == default else ""))
-        agents = data.get("agents") or []
-        self.agents_label.setText(f"Agents：{len(agents)}")
+        active = data.get("active_target")
+        self.target_label.setText(f"当前目标：{active}" if active else "当前目标：无（鼠标所在屏幕没有 Agent）")
+        agents = sorted(data.get("agents") or [], key=lambda a: a.get("host", ""))
+        self.hosts.clear()
+        for agent in agents:
+            host = agent.get("host", "")
+            is_target = host == active
+            item = QtWidgets.QTreeWidgetItem([host, "当前目标" if is_target else "在线"])
+            item.setForeground(1, QtGui.QColor("#2ea043" if is_target else "#8f959e"))
+            if is_target:
+                font = item.font(0)
+                font.setBold(True)
+                item.setFont(0, font)
+            self.hosts.addTopLevelItem(item)
         current = self.target_combo.currentText()
         self.target_combo.blockSignals(True)
         self.target_combo.clear()
         self.target_combo.addItem("自动（当前屏幕）")
         for agent in agents:
-            host = agent.get("host")
-            if host:
-                self.target_combo.addItem(host)
-        if current and current != "自动（当前屏幕）":
-            index = self.target_combo.findText(current)
-            if index >= 0:
-                self.target_combo.setCurrentIndex(index)
+            self.target_combo.addItem(agent.get("host", ""))
+        index = self.target_combo.findText(current)
+        self.target_combo.setCurrentIndex(max(0, index))
         self.target_combo.blockSignals(False)
 
     # ------------------------------------------------------------------ window / tray

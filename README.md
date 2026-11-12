@@ -7,9 +7,11 @@
 - **目标跟随**：Deskflow 的 `enterCommand` / `exitCommand` 通知本机 Agent，Agent 用心跳维护 `active_target`。
 - **不抢剪贴板**：默认走本机输入接口；Windows 用 Unicode `SendInput`；Linux 用 XTest/xdotool，中文失败时才按需启用剪贴板回退。
 
-当前阶段：**文本隧道 MVP + 无边框紧凑 HUD**（ASR/PTT 尚未接入）。
+当前阶段：**按住说话 → 流式字幕浮窗（Windows 跟随输入光标，Ubuntu 跟随鼠标）→ 松手上屏**，四台机器（X99 / X670 / MetawiseBook / OMEN）均已部署。
 
-![HUD preview](docs/images/hud-preview.png)已在 X99 + gedit、X99→x670 / .98 上验证中英文/符号注入、焦点保持和剪贴板还原；Windows Agent 已部署连接，SendInput 待真实应用复验。跨主机文本通道已可用；Deskflow 的 enter/exit 事件命令已在 X99/x670/.98 配置，移动鼠标切屏应能自动更新目标。Windows 的 Deskflow 事件尚未配置。
+![HUD preview](docs/images/hud-preview.png)
+
+浮窗状态从上到下：静音聆听、识别中（浅灰为尚未稳定的尾字）、长句换行、松手后整段校正、上屏失败提示。
 
 ## 目录
 
@@ -42,8 +44,8 @@ voice-tunnel send --config config.ini --target yuchen-X99 --text "hello 语音�
 HUD 预览联调（不需要 ASR）：
 
 ```bash
-voice-tunnel preview --target yuchen-X99 --text "这是已经识别的部分" --stable-len 4
-voice-tunnel final   --target yuchen-X99 --text "这是已经识别的部分，后面还在识别"
+voice-tunnel preview --target yuchen-X99 --text "这是已经识别的部分" --stable 4   # 前 4 字深色，其余浅灰
+voice-tunnel final   --target yuchen-X99                                          # 收起浮窗
 ```
 
 Agent 的健康检查：
@@ -129,7 +131,8 @@ vLLM 流式实测（同一段音频，1s chunk）：0.5s 出“你好。”→ 1
 python3 gui/voice_tunnel_gui.py
 ```
 
-- 可在界面里改 PTT 键（点击后按实际按键自动识别）、麦克风（下拉）、模型（下拉）、GPU/CPU、目标主机、安装位置、partial 预览间隔
+- 顶部一行显示监听状态和当前目标主机；右侧“主机”列表显示各 Agent 在线情况与当前目标
+- 可改说话键（点击后按实际按键自动识别）、麦克风、识别后端、模型、GPU/CPU、目标主机、数据目录；流式后端的刷新节拍固定约 0.2s，间隔设置只对整段重解码后端生效
 - “保存并应用”会重启监听；PTT 设备是键盘的 Linux event 节点，默认已指向 ROYUAN 键盘，无需手动改
 - `Ctrl+R` 开始监听，`Ctrl+T` 停止
 - 关闭窗口会最小化到右上角托盘；点击托盘图标在“显示/隐藏主窗口”之间切换，菜单也会同步
@@ -137,10 +140,10 @@ python3 gui/voice_tunnel_gui.py
 
 ## 当前限制
 
-- Linux 文本注入依赖 `xdotool`（ASCII/部分 Unicode）或显式启用的剪贴板回退。
-- Windows 注入在用户会话运行；UAC 高权限窗口暂不支持。
-- HUD 是无边框紧凑候选条（1–3 行、半透明、不抢焦点），优先光标、鼠标兜底；AT-SPI/Windows caret 精确定位在后续版本增强。
-- 语音采集、ASR、PTT 尚未实现。
+- Linux 文本注入依赖 `xdotool`/`xclip`（剪贴板模式，0.8s 后后台还原文本剪贴板）。
+- Windows Agent 必须在用户桌面会话运行（计划任务 VoiceTunnelAgent）；从 SSH 启动会落在 Session 0，Agent 会直接拒绝启动。UAC 高权限窗口不支持。
+- 浮窗定位：Ubuntu 跟随鼠标；Windows 取 Win32 caret 或 MSAA caret（Chrome/Electron），拿不到时（如 Windows Terminal）回退到聚焦窗口内的鼠标或窗口左下角。
+- 鼠标停在没有 Agent 的屏幕（如 xiaoxin15）时目标为“无”，语音不会再被送到 X99。
 
 ## 文档
 

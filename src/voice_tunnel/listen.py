@@ -322,7 +322,8 @@ class ASREngine:
         self.stream_id = str(result.get("session_id", ""))
         return bool(self.stream_id)
 
-    def push_stream(self, audio: Any, final: bool = False) -> str:
+    def push_stream(self, audio: Any, decode: bool = True) -> str:
+        """追加音频；decode=False 时只追加不解码（静音段 / 松手收尾前）。"""
         import base64
 
         import numpy as np
@@ -332,17 +333,13 @@ class ASREngine:
         payload = {
             "session_id": self.stream_id,
             "audio": base64.b64encode(np.asarray(audio, dtype=np.float32).tobytes()).decode("ascii"),
-            "final": final,
+            "decode": decode,
         }
         try:
-            result = self._service_post("/stream/chunk", payload, timeout=120)
+            result = self._service_post("/stream/chunk", payload, timeout=30)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("stream chunk failed: %s", exc)
-            if final:
-                self.stream_id = ""
             return ""
-        if final:
-            self.stream_id = ""
         text = str(result.get("text", "")).strip()
         if text and self.config.simplify:
             text = _to_simplified(text)
@@ -494,63 +491,86 @@ def keytest(config: VoiceConfig, seconds: float = 20.0, once: bool = False) -> N
 
 
 class VoiceListener:
+    STREAM_STEP_SEC = 0.12   # 流式推送节拍；解码本身约 0.1s，实际刷新约 0.2s 一次
+    SPEECH_HOLD_SEC = 0.8    # 最近这么久内有语音才解码，静音段只追加音频
+    PAUSE_REFRESH_SEC = 0.7  # 停顿这么久做一次整段微调（修正前文）
+
     def __init__(self, config: VoiceConfig, config_path: str) -> None:
+        from .control import ControlClient
+
         self.config = config
         self.config_path = config_path
         self.recorder = AudioRecorder(config)
         self.asr = ASREngine(config)
+        # 浮窗事件与文本插入分两条长连接：插入要等 Agent ACK，不能阻塞下一句的浮窗
+        self.hud_client = ControlClient(config_path, timeout=3)
+        self.send_client = ControlClient(config_path, timeout=20)
         self.recording = False
-        self.record_started = 0.0
-        self.partial_thread: threading.Thread | None = None
-        self.partial_stop = threading.Event()
+        self.target: str | None = None
+        self.session_thread: threading.Thread | None = None
+        self.session_stop = threading.Event()
         self.final_queue: queue.Queue[Any] = queue.Queue()
         self.worker = threading.Thread(target=self._worker, daemon=True, name="asr-worker")
         self.max_timer: threading.Timer | None = None
         self.ptt: PttListener | None = None
-        self.prev_partial = ""
-        self.last_partial_shown = ""
+        self.shown = ""
         self._lock_handle: Any = None
         self._stream_active = False
         self._stream_sent = 0
-        self._silence_ticks = 0
-        self._stable_ticks = 0
-        self._peak_level = 0.0
+        self._speech_since_refresh = False
         self._stream_lock = threading.Lock()
 
-    def _send_control(self, message: dict[str, Any]) -> dict[str, Any]:
-        from .cli import control_request
+    # ------------------------------------------------------------------ hud / target
 
-        return control_request(self.config_path, message, timeout=20)
-
-    def _notify_partial(self, text: str) -> None:
+    def _resolve_target(self) -> str | None:
+        if self.config.target != "active":
+            return self.config.target
         try:
-            self._send_control(
-                {"command": "preview", "target": self.config.target, "text": text, "stable_len": -1}
-            )
+            result = self.hud_client.request({"command": "resolve"})
+            return (result.get("data") or {}).get("target")
         except Exception as exc:  # noqa: BLE001
-            LOG.debug("partial display failed: %s", exc)
+            LOG.warning("resolve target failed: %s", exc)
+            return None
+
+    def _hud(self, event: str, target: str | None = None, **fields: Any) -> None:
+        target = target or self.target
+        if not target:
+            return
+        try:
+            result = self.hud_client.request({"command": "hud", "event": event, "target": target, **fields})
+            if not result.get("ok"):
+                LOG.debug("hud %s failed: %s", event, result.get("error"))
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("hud %s failed: %s", event, exc)
+
+    def _show_partial(self, text: str, settled: bool = False) -> None:
+        if not text or (text == self.shown and not settled):
+            return
+        # 与上一次相同的前缀视为已稳定（深色），新出现/被改写的尾部用浅色
+        stable = len(text) if settled else len(self._common_prefix(self.shown, text))
+        self.shown = text
+        self._hud("partial", text=text, stable=stable, level=self._ui_level())
+
+    def _ui_level(self) -> float:
+        rms = self.recorder.recent_level()
+        return round(min(1.0, (max(0.0, rms - 0.003) / 0.08) ** 0.5), 2)
+
+    # ------------------------------------------------------------------ PTT
 
     def on_press(self) -> None:
         if self.recording:
             return
         self.recording = True
-        self.record_started = time.time()
-        self.prev_partial = ""
-        self.last_partial_shown = ""
-        self._stream_active = False
-        self._peak_level = 0.0
+        self.shown = ""
         try:
             self.recorder.start()
         except Exception as exc:  # noqa: BLE001
             self.recording = False
             LOG.error("recording start failed: %s", exc)
             return
-        self.partial_stop = threading.Event()
-        self._stream_sent = 0
-        self._stream_active = self.asr.streaming() and self.asr.start_stream()
-        if self.config.partial:
-            self.partial_thread = threading.Thread(target=self._partial_loop, daemon=True, name="partial-asr")
-            self.partial_thread.start()
+        self.session_stop = threading.Event()
+        self.session_thread = threading.Thread(target=self._session_loop, daemon=True, name="ptt-session")
+        self.session_thread.start()
         if self.config.max_seconds > 0:
             self.max_timer = threading.Timer(self.config.max_seconds, self._auto_stop)
             self.max_timer.daemon = True
@@ -568,40 +588,50 @@ class VoiceListener:
         if self.max_timer is not None:
             self.max_timer.cancel()
             self.max_timer = None
-        self.partial_stop.set()
-        if self.partial_thread is not None:
-            self.partial_thread.join(timeout=5 if self._stream_active else 0.1)
-            self.partial_thread = None
+        self.session_stop.set()
+        if self.session_thread is not None:
+            self.session_thread.join(timeout=5)
+            self.session_thread = None
         try:
             audio = self.recorder.stop()
         except Exception as exc:  # noqa: BLE001
             LOG.error("recording stop failed: %s", exc)
-            self.asr.close_stream()
-            self._stream_active = False
+            self._end_stream()
+            self._hud("hide")
             return
         duration = len(audio) / self.config.sample_rate if len(audio) else 0.0
         if duration < self.config.min_seconds:
             LOG.info("ignore short utterance: %.2fs", duration)
-            self.asr.close_stream()
-            self._stream_active = False
+            self._end_stream()
+            self._hud("hide")
             return
         LOG.info("utterance captured: %.2fs", duration)
+        self._hud("finish")
+        target = self.target
         if self._stream_active:
-            text = ""
             with self._stream_lock:
-                delta = audio[self._stream_sent :]
-                self._stream_sent = len(audio)
-                if len(delta):
-                    self.asr.push_stream(delta)
-                # 松手收尾用无前缀整段重解码（refresh），避免 finish 的固定前缀造成复读
-                text = self.asr.refresh_stream()
-            self.asr.close_stream()
-            self._stream_active = False
+                if self.shown and not self._speech_since_refresh:
+                    # 停顿校正后没再说话：已显示的就是最终结果。再解码只剩静音，模型会编出"嗯。"
+                    text = self.shown
+                else:
+                    delta = audio[self._stream_sent :]
+                    self._stream_sent = len(audio)
+                    if len(delta):
+                        self.asr.push_stream(delta, decode=False)
+                    # 松手收尾用无前缀整段重解码（refresh），避免固定前缀造成复读
+                    text = self.asr.refresh_stream()
+            self._end_stream()
             if text:
-                self.final_queue.put(("text", text))
+                self.final_queue.put(("text", text, target))
                 return
             LOG.warning("stream refresh empty, falling back to full decode")
-        self.final_queue.put(("audio", audio))
+        self.final_queue.put(("audio", audio, target))
+
+    def _end_stream(self) -> None:
+        self.asr.close_stream()
+        self._stream_active = False
+
+    # ------------------------------------------------------------------ session
 
     @staticmethod
     def _common_prefix(left: str, right: str) -> str:
@@ -622,44 +652,59 @@ class VoiceListener:
             text = text[: repeated.start()].strip()
         return text
 
-    def _partial_loop(self) -> None:
+    def _session_loop(self) -> None:
+        # 按下即锁定目标：整句的浮窗和最终插入都发往同一台机器，不随中途切屏漂移
+        self.target = self._resolve_target()
+        if not self.target:
+            LOG.warning("no active target (pointer on a screen without agent?)")
+        self._hud("listen", level=0.0)
+        self._stream_sent = 0
+        self._stream_active = self.config.partial and self.asr.streaming() and self.asr.start_stream()
+        if self._stream_active:
+            self._stream_loop()
+        else:
+            self._window_loop()
+
+    def _stream_loop(self) -> None:
+        last_speech = time.time()
+        self._speech_since_refresh = False
+        peak = 0.0
+        while not self.session_stop.wait(self.STREAM_STEP_SEC):
+            now = time.time()
+            level = self.recorder.recent_level()
+            # 自适应静音阈值：相对本次说话的峰值，避免底噪高于固定阈值时永远判不出停顿
+            peak = max(peak, level)
+            if level >= max(0.004, peak * 0.06):
+                last_speech = now
+                self._speech_since_refresh = True
+            with self._stream_lock:
+                audio = self.recorder.raw_snapshot()
+                delta = audio[self._stream_sent :]
+                self._stream_sent = len(audio)
+                speaking = now - last_speech < self.SPEECH_HOLD_SEC
+                text = self.asr.push_stream(delta, decode=speaking) if len(delta) else ""
+                settled = False
+                if self._speech_since_refresh and now - last_speech >= self.PAUSE_REFRESH_SEC:
+                    self._speech_since_refresh = False
+                    text = self.asr.refresh_stream() or text
+                    settled = True
+            if text and (text != self.shown or settled):
+                self._show_partial(text, settled)
+            else:
+                self._hud("level", level=self._ui_level())
+
+    def _window_loop(self) -> None:
+        """whisper / transformers 后端：滑窗重解码 + 连续两次的公共前缀作为预览。"""
         window_sec = QWEN_PARTIAL_WINDOW_SEC if self.config.backend.lower() in QWEN_BACKENDS else 0.0
         window_start = 0
-        while not self.partial_stop.wait(self.config.partial_interval):
-            if not self.recording:
-                return
-            if self._stream_active:
-                with self._stream_lock:
-                    audio = self.recorder.raw_snapshot()
-                    delta = audio[self._stream_sent :]
-                    self._stream_sent = len(audio)
-                    # 自适应静音阈值：相对本次说话的峰值，避免底噪高于固定阈值时永远判不出"停顿"
-                    level = self.recorder.recent_level()
-                    self._peak_level = max(self._peak_level, level)
-                    silent = level < max(0.004, self._peak_level * 0.06)
-                    self._silence_ticks = self._silence_ticks + 1 if silent else 0
-                    text = ""
-                    if len(delta):
-                        text = self.asr.push_stream(delta)
-                    refresh_now = False
-                    if self._silence_ticks == 3:  # 静音约 1.5s：认为这一句结束
-                        self._silence_ticks += 1  # 每次停顿只触发一次，再说话归零
-                        refresh_now = True
-                    if text and text == self.last_partial_shown:
-                        self._stable_ticks += 1
-                    else:
-                        self._stable_ticks = 0
-                    if self._stable_ticks == 4:  # 文本 3s 没变化：也触发一次修正兜底
-                        self._stable_ticks = 0
-                        refresh_now = True
-                    if refresh_now and self.asr.stream_id:
-                        refreshed = self.asr.refresh_stream()
-                        if refreshed:
-                            text = refreshed
-                if text and text != self.last_partial_shown:
-                    self.last_partial_shown = text
-                    self._notify_partial(text)
+        prev = ""
+        tick = min(0.12, self.config.partial_interval)
+        next_decode = time.time() + self.config.partial_interval
+        while not self.session_stop.wait(tick):
+            if time.time() < next_decode or not self.config.partial:
+                self._hud("level", level=self._ui_level())
                 continue
+            next_decode = time.time() + self.config.partial_interval
             if self.recorder.recent_level() < 0.004:
                 continue
             audio = self.recorder.snapshot()
@@ -671,53 +716,59 @@ class VoiceListener:
                     start = len(audio) - keep
                     if start != window_start:
                         window_start = start
-                        self.prev_partial = ""
+                        prev = ""
                     audio = audio[start:]
             try:
                 text = self._clean_partial(self.asr.transcribe(audio, partial=True))
-                if not text:
-                    continue
-                if not self.prev_partial:
-                    self.prev_partial = text
-                    continue
-                prefix = self._common_prefix(self.prev_partial, text)
-                self.prev_partial = text
-                if len(prefix) < 2 or prefix == self.last_partial_shown:
-                    continue
-                self.last_partial_shown = prefix
-                LOG.debug("partial stable: %s", prefix)
-                self._notify_partial(prefix)
             except Exception as exc:  # noqa: BLE001
                 LOG.debug("partial ASR failed: %s", exc)
+                continue
+            if not text:
+                continue
+            prefix = self._common_prefix(prev, text) if prev else ""
+            prev = text
+            if len(prefix) >= 2:
+                self._show_partial(prefix, settled=True)
+
+    # ------------------------------------------------------------------ final
 
     def _worker(self) -> None:
         while True:
             item = self.final_queue.get()
             if item is None:
                 return
-            kind, payload = item
+            kind, payload, target = item
             if kind == "text":
                 text = payload
             else:
                 try:
-                    # 兜底整段识别：补上 trim/normalize（stop 现在返回原始音频）
+                    # 兜底整段识别：补上 trim/normalize（stop 返回原始音频）
                     processed = normalize_audio(trim_silence(payload, self.config.sample_rate))
                     text = self.asr.transcribe(processed, partial=False)
                 except Exception as exc:  # noqa: BLE001
                     LOG.exception("ASR failed: %s", exc)
+                    self._hud("error", target, text="识别失败")
                     continue
             if not text:
                 LOG.info("ASR returned empty text")
+                self._hud("hide", target)
                 continue
             LOG.info("ASR: %s", text)
+            target = target or self._resolve_target()
+            if not target:
+                LOG.error("insert skipped: no active target")
+                continue
             try:
-                result = self._send_control({"command": "send", "target": self.config.target, "text": text})
-                if not result.get("ok"):
-                    LOG.error("insert failed: %s", result.get("error"))
-                else:
-                    LOG.info("inserted into %s", result.get("data", {}).get("target"))
+                result = self.send_client.request({"command": "send", "target": target, "text": text})
             except Exception as exc:  # noqa: BLE001
-                LOG.error("dispatch failed: %s", exc)
+                result = {"ok": False, "error": str(exc)}
+            if result.get("ok"):
+                LOG.info("inserted into %s", target)
+            else:
+                LOG.error("insert into %s failed: %s", target, result.get("error"))
+                self._hud("error", target, text=f"未能输入：{result.get('error')}")
+
+    # ------------------------------------------------------------------ lifecycle
 
     def run(self) -> None:
         self._lock_handle = open("/tmp/voice-tunnel-listen.lock", "w")
@@ -756,7 +807,7 @@ class VoiceListener:
     def stop(self) -> None:
         if self.ptt is not None:
             self.ptt.stop()
-        self.partial_stop.set()
+        self.session_stop.set()
         self.final_queue.put(None)
         if self._lock_handle is not None:
             try:

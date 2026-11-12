@@ -1,6 +1,6 @@
 # 实施状态
 
-更新：2026-11-11
+更新：2026-11-12
 
 ## 已完成
 
@@ -18,7 +18,27 @@
 - [x] x670 / .98 部署并验证 X99→客户端注入（clipboard 模式，文本精确 + 旧剪贴板还原）
 - [x] 终端自动使用 Ctrl+Shift+V（xprop WM_CLASS，X99 gnome-terminal 已验证）
 
+## 2026-11-12 修复与重做
+
+- [x] 服务端：Agent 重连时旧连接收尾误删新连接（导致"agent not connected"）
+- [x] 服务端：所有 Agent 3s 心跳 + pong，15s 无消息断开；Agent 读超时重连（死连接不再假在线）
+- [x] 目标状态机：enter 让其他 Agent 失活、leave 1.5s 宽限、出现过切屏事件后目标未知不再回退 X99
+- [x] 监听端：按下即锁定目标，整句浮窗与插入发往同一台机器；浮窗/插入分两条长连接
+- [x] 流式：服务端自调度增量解码（新音频合并解一次）、0.12s 推送、静音不解码、停顿 0.7s 整段校正、启动预热；实测首字 0.52s、刷新中位 0.24s、松手到上屏 0.27s
+- [x] 浮窗重做：聆听/识别/收尾/错误四态、逐字显现、音量条、提交即消失；Linux fcitx 光标定位、Windows Win32/MSAA 光标定位；GTK override-redirect 弹层 / Tk 不激活显示 + 系统投影 + DPI 感知
+- [x] Windows：SendInput 整段一次提交；Session 0 启动直接拒绝；`restart.ps1` 改存 UTF-8 BOM（原文件被 PowerShell 5 按 GBK 解析导致计划任务启动失败）
+- [x] Linux 剪贴板还原改为后台进行，ACK 不再等待 1s
+- [x] GUI 改版：状态行 + 主机列表 + 克制配色；状态轮询改走控制长连接
+- [x] 单元测试：服务端目标状态机、HUD 状态机/定位、fcitx 解析（20 项）
+- [x] Ubuntu 浮窗改为跟随鼠标（fcitx 被动上报 / AT-SPI 在终端、微信等程序上不可靠），移除 Linux 光标探测代码；Windows 保持输入光标定位
+- [x] 长句：`max_seconds` 30→300（仅防卡键）；服务端 20s 分段定稿、`max_model_len` 4096 / `max_new_tokens` 512；实测 57.6s 连续语音 242 字完整上屏
+- [x] GUI 将监听输出同步写入 `<data_dir>/logs/listen.log`
+- [x] 审查修复：控制长连接超时不重发（防重复插入）；停顿定稿后静音松手不再解码（防末尾冒出“嗯。”）；HUD 忽略未知事件、Tk 轮询异常后仍续约；Agent 重连后保留当前目标
+
 ## 下一步
+
+- [ ] 实机确认 Windows 浮窗外观与光标定位（VS Code / Chrome / 记事本 / Windows Terminal）
+- [ ] Linux 三台 systemd 自启动；X99 serve/asr/agent 目前在 tmux（vt-serve / vt-asr / vt-agent）
 
 - [x] Windows(.13) Agent 已部署并连接（SendInput 待真实应用复验）
 - [ ] Linux 注入测试矩阵（VS Code / 浏览器）——gedit 和 gnome-terminal 已验证

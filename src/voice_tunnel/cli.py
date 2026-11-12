@@ -6,50 +6,13 @@ import argparse
 import asyncio
 import json
 import logging
-import socket
 import sys
 from pathlib import Path
 from typing import Any
 
-from .config import load_agent_config, load_server_config
-from .protocol import PROTOCOL_VERSION, encode_message
+from .config import load_server_config
+from .control import control_request
 from .server import TunnelServer
-
-
-def _read_line(sock: socket.socket, buffer: bytearray) -> dict[str, Any]:
-    while b"\n" not in buffer:
-        chunk = sock.recv(65536)
-        if not chunk:
-            raise ConnectionError("server closed connection")
-        buffer.extend(chunk)
-    line, _, rest = buffer.partition(b"\n")
-    buffer[:] = rest
-    return json.loads(line.decode("utf-8"))
-
-
-def control_request(config_path: str | None, message: dict[str, Any], timeout: float = 8.0) -> dict[str, Any]:
-    cfg = load_agent_config(config_path)
-    host = cfg.server
-    if host in {"0.0.0.0", "::", ""}:
-        host = "127.0.0.1"
-    with socket.create_connection((host, cfg.port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        buffer = bytearray()
-        sock.sendall(
-            encode_message(
-                {
-                    "type": "hello",
-                    "version": PROTOCOL_VERSION,
-                    "role": "control",
-                    "token": cfg.token,
-                }
-            )
-        )
-        hello = _read_line(sock, buffer)
-        if not hello.get("ok"):
-            raise RuntimeError(f"auth failed: {hello.get('error')}")
-        sock.sendall(encode_message({"type": "control", **message}))
-        return _read_line(sock, buffer)
 
 
 def _print_result(result: dict[str, Any]) -> int:
@@ -131,16 +94,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_preview(args: argparse.Namespace) -> int:
-    result = control_request(
-        args.config,
-        {"command": "preview", "target": args.target, "text": args.text, "stable_len": args.stable_len},
-    )
-    return _print_result(result)
+    message = {"command": "hud", "event": "partial", "target": args.target, "text": args.text, "stable": args.stable}
+    return _print_result(control_request(args.config, message))
 
 
 def cmd_final(args: argparse.Namespace) -> int:
-    result = control_request(args.config, {"command": "final", "target": args.target, "text": args.text})
-    return _print_result(result)
+    message = {"command": "hud", "event": "hide", "target": args.target}
+    return _print_result(control_request(args.config, message))
 
 
 def cmd_target(args: argparse.Namespace) -> int:
@@ -184,12 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
     preview = sub.add_parser("preview", help="send partial text to the HUD (testing)")
     preview.add_argument("--target", default="active")
     preview.add_argument("--text", required=True)
-    preview.add_argument("--stable-len", type=int, default=-1)
+    preview.add_argument("--stable", type=int, default=-1, help="chars already fixed (rest drawn lighter)")
     preview.set_defaults(func=cmd_preview)
 
-    final = sub.add_parser("final", help="send final text to the HUD (testing)")
+    final = sub.add_parser("final", help="hide the HUD (testing)")
     final.add_argument("--target", default="active")
-    final.add_argument("--text", required=True)
     final.set_defaults(func=cmd_final)
 
     target = sub.add_parser("target", help="set or clear manual active target")

@@ -24,8 +24,8 @@ Voice Server 与 Deskflow Server 不必是同一台；当前都在 X99。
 PTT evdev 按键按住/松开
   → sounddevice 采集（USB 麦克风，48k 单声道）
   → 线性重采样到 16k + 峰值归一化
-  → partial: 预览更新（见下）→ 目标机 HUD
-  → 松开: 整段解码（或流式 final）
+  → 按下即锁定目标主机并弹出聆听浮窗；partial 预览更新（见下）→ 目标机 HUD
+  → 松开: 整段解码（或流式 refresh 收尾）
   → zhconv 繁转简
   → voice-tunnel send（target=active）→ Agent 注入
 ```
@@ -38,15 +38,16 @@ PTT evdev 按键按住/松开
 | --- | --- | --- | --- |
 | faster-whisper | 每 0.5s 用 small 重解码全段，取连续两次的最长公共前缀 | 整段解码 | ~0.2s |
 | Qwen3-ASR（transformers） | 每 0.8s 重解码最近 8s | 整段解码 | ~1s |
-| Qwen3-ASR（vLLM 流式） | 增量推送音频块，模型内部回滚未固定 token 并重出全文 | `finish_streaming_transcribe` 收尾 | 待实测 |
+| Qwen3-ASR（vLLM 流式） | 每 0.12s 推送新音频，服务端合并后解一次（前缀回滚 5 token） | 无前缀整段 refresh | 首字 0.5s，刷新约 0.24s，松手 0.27s |
 
-流式（vLLM）与豆包类产品的共同机制：
+流式（vLLM）调度（`scripts/qwen_asr_service.py`，不使用库自带的固定块长循环）：
 
-1. 音频按固定窗口（1s）切块，边录边送；
-2. 每个新块到达后，用 `已固定前缀 + 最近若干块` 重新解码，回滚最后几个 token（`unfixed_token_num`），因此前文会被后续语义修正；
-3. 松手时把剩余不足一个窗口的音频送入 `finish_streaming_transcribe`，做一次整段收尾（类似“二次微调”）。
+1. 监听端每 0.12s 把新录到的音频全部推给 `/stream/chunk`；最近 0.8s 内有语音才要求解码，静音段只追加；
+2. 服务端把新音频并入后只解一次（新音频 ≥0.1s 才解）：前 1.5s 不用前缀，之后以上次结果回滚 5 个 token 为前缀，尾部可被修正；解码慢时请求自然合并，延迟不累积；
+3. 停顿 0.7s 调 `/stream/refresh` 做无前缀整段重解码，修正前文；当前段已超过 20s 时把结果定稿，之后只解码新的一段（长句不受生成长度限制，解码耗时不随句长增长）；松手同样用 refresh 收尾；
+4. 服务启动时先做一次预热解码，避免第一次按键等 4s 以上的编译。
 
-服务端接口：`/stream/start`、`/stream/chunk`（`final=true` 收尾）、`/stream/cancel`。
+服务端接口：`/stream/start`、`/stream/chunk`（`decode` 控制是否解码）、`/stream/refresh`、`/stream/cancel`。
 
 ## 文本分发
 
@@ -68,32 +69,30 @@ Deskflow 切屏
 
 规则：
 
-- `enter` 设置 `active_target`。
-- `leave` 只在 `active_target == 自己` 时清除，避免乱序误清。
-- 活跃 Agent 5s 心跳；15s 无心跳 → `unknown`，不猜目标。
-- 启动默认 `yuchen-X99`。
-- 支持手动覆盖；下一次 Deskflow 事件或超时后失效。
+- `enter` 设置 `active_target`，并向其他自认为活跃的 Agent 发 `active_state=false`（同一时刻只有一个鼠标；用于修复丢失的 leave）。
+- `leave` 只在 `active_target == 自己` 时生效，且有 1.5s 宽限（Windows Deskflow 常出现 leave→enter 抖动）。
+- 宽限过后仍无新 enter：鼠标在没有 Agent 的屏幕上，目标为“无”，不回退默认主机。
+- `default_target` 只在服务端启动后、尚未收到任何切屏事件时使用。
+- 所有 Agent 每 3s 心跳（携带 active），服务端回 pong；15s 无消息即断开连接，Agent 读超时 15s 自动重连。活跃心跳可在目标为空时恢复丢失的 enter。
+- 一句话的目标在按下说话键时锁定，浮窗和最终插入都发往同一台机器。
+- 支持手动覆盖；超时后失效。
 
 ## HUD
 
-- partial 只做预览，**不写入编辑器**；final 在松开后插入。
-- 位置优先级：光标 → 焦点窗口 → 鼠标；取不到时静默回退。
-- 输入法风格浮窗（GTK3 + cairo）：14px 圆角卡片（97% 不透明）、柔和多层阴影、1px 浅描边、左侧蓝色说话指示点；已固定文字深色、未固定候选灰色。Windows 回退 Tk 版（后续再做圆角）。
-- 无滚动条；宽度随内容增长（上限 440px），高度按换行行数增长（上限 6 行），超长文本自动跟随末尾，滚轮回看。
-- 文本注入成功时候选框立即消失（输入法习惯）；说话中 6 秒无更新自动消失，避免目标切换/注入失败后滞留。
-- partial 通过稳定前缀 / 流式回滚减少“呜呜/不然”这类未稳定幻觉。
-- 锚点优先级：AT-SPI 光标（Windows GetGUIThreadInfo / Linux 已禁用）→ 鼠标在聚焦窗口内时用鼠标 → 否则贴聚焦窗口左下角 → 兜底鼠标。
-- Agent 必须带图形会话环境运行（DISPLAY/XAUTHORITY），远端机器用 `~/voice-tunnel/run-agent.sh` 启动。
-- 不使用角落固定 HUD；当前贴着鼠标/光标出现，最大宽度约 46 个字符。
-- Linux 后续实验 fcitx4 `InputContext.UpdatePreedit` / `CommitString` 信号，争取做到输入法内联预编辑；失败则保留 HUD。
-- Windows 后续用 UI Automation / GetCaretPos 精确定位。
+- 事件（服务端 `hud` 消息）：`listen`（按下即弹出）、`level`（音量）、`partial`（文本 + 已稳定字数）、`finish`（松手，整段校正中）、`commit`（上屏，立即消失）、`error`（2.5s 后消失）、`hide`。
+- 状态机 `HudModel` 与绘制分离：新字逐字显现（约 0.1s 追上），被改写的部分立即替换；已稳定文字深色、尾部浅灰；左侧 3 根音量条（静音时为三点），收尾时三点呼吸，错误为红点；无事件 8s 自动收起。
+- 外观：白色卡片、9px 圆角、1px 浅描边、轻投影；宽度随内容增长且一句话内只增不减（上限 520px），最多 3 行，超出只保留末尾并以省略号开头。
+- 定位：Ubuntu 跟随鼠标（按下说话键时的鼠标位置右下方，一句话内不动）；Windows 放在输入光标正下方、文字起点对齐光标，下方放不下放上方；均限制在所在显示器工作区内。
+- Windows 光标来源：先 `GetGUIThreadInfo.rcCaret`，再 MSAA `OBJID_CARET`，都拿不到时用聚焦窗口内的鼠标或窗口左下角。Ubuntu 曾尝试 fcitx 光标上报与 AT-SPI：终端等 GTK 程序只在聚焦/按键时上报，微信/Edge/VS Code 默认不开放 AT-SPI，说话时常拿不到光标，2026-11-12 改为统一跟随鼠标。
+- Linux 渲染：GTK3 override-redirect 弹层（不经窗口管理器，永不抢焦点）+ cairo。Windows 渲染：Tk 画布，`WS_EX_NOACTIVATE|TOOLWINDOW|TOPMOST`、`CS_DROPSHADOW`，`SW_SHOWNOACTIVATE` 显示，进程 Per-Monitor DPI 感知。
+- Agent 必须带图形会话环境运行：Linux 远端用 `~/voice-tunnel/run-agent.sh`（DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR/DBUS）；Windows 用计划任务 VoiceTunnelAgent（`start-agent.cmd` → `restart.ps1`，该脚本须保存为 UTF-8 BOM）。
 
 ## 文本注入
 
 | 平台 | 首选 | 回退 |
 |---|---|---|
-| Windows | `SendInput` + `KEYEVENTF_UNICODE` | 无（剪贴板不作为默认） |
-| Linux X11 | `inject_mode=clipboard`：xclip + `xprop WM_CLASS` 判断窗口 → 终端 `Ctrl+Shift+V`，其他 `Ctrl+V` | `xdotool type`（仅无 IME 的 US 布局，兼容性差） |
+| Windows | `SendInput` + `KEYEVENTF_UNICODE`，整段一次提交 | 无（剪贴板不作为默认） |
+| Linux X11 | `inject_mode=clipboard`：xclip + `xprop WM_CLASS` 判断窗口 → 终端 `Ctrl+Shift+V`，其他 `Ctrl+V`；0.8s 后后台还原剪贴板 | `xdotool type`（仅无 IME 的 US 布局，兼容性差） |
 
 剪贴板会短暂覆盖系统剪贴板；当前只备份/还原文本，图片/HTML 多格式内容不做无损恢复承诺。Linux 部署默认启用 `inject_mode=clipboard`。
 

@@ -40,22 +40,47 @@ Agent 收到本机 Deskflow 事件后：
 {"type":"active","host":"yuchen-X670","state":"enter","ts":1794389000.0}
 ```
 
-活跃期间每 5 秒：
+所有 Agent 每 3 秒（无论是否活跃），服务端回 `pong`：
 
 ```json
 {"type":"heartbeat","host":"yuchen-X670","active":true,"ts":1794389005.0}
+{"type":"pong","ts":1794389005.0}
 ```
 
-服务端维护 `active_target`；15 秒无心跳视为 unknown。
+服务端 15 秒收不到某 Agent 的任何消息即断开该连接；Agent 15 秒收不到任何消息即重连。
 
-## 流式预览（预留）
+另一台机器 enter 后，服务端通知其余自认为活跃的 Agent 失活（修复丢失的 leave）：
 
 ```json
-{"type":"partial","request_id":"uuid","text":"检查 PPO 的","stable_len":6}
-{"type":"final","request_id":"uuid","text":"检查 PPO 的输入维度"}
+{"type":"active_state","active":false}
 ```
 
-Agent 收到后更新 HUD；`final` 只做展示，真正插入由 `insert_text` 完成。
+## 浮窗（HUD）
+
+服务端 → Agent：
+
+```json
+{"type":"hud","event":"listen","level":0.0}
+{"type":"hud","event":"partial","text":"检查 PPO 的","stable":3,"level":0.42}
+{"type":"hud","event":"level","level":0.18}
+{"type":"hud","event":"finish"}
+{"type":"hud","event":"commit"}
+{"type":"hud","event":"error","text":"未能输入：..."}
+{"type":"hud","event":"hide"}
+```
+
+`stable` 为已稳定的字数（之后的尾部浅色显示）。Agent 收到 `insert_text` 时自行收起浮窗（等价于 `commit`），注入失败显示 `error`。
+
+## 控制命令（CLI / 监听端 → 服务端）
+
+```json
+{"type":"control","command":"resolve"}
+{"type":"control","command":"hud","target":"OMEN","event":"partial","text":"...","stable":3,"level":0.4}
+{"type":"control","command":"send","target":"OMEN","text":"..."}
+{"type":"control","command":"status"}
+```
+
+`resolve` 返回当前目标（可能为 `null`）；监听端在按下说话键时调用一次，之后整句都用显式 `target`。
 
 ## 本地事件入口（Agent）
 

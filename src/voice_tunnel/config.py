@@ -42,7 +42,7 @@ class VoiceConfig:
     beam_size: int = 5
     target: str = "active"
     min_seconds: float = 0.3
-    max_seconds: float = 30.0
+    max_seconds: float = 300.0  # 防止卡键的保护上限，不是句长限制
     download_root: str = ""
 
 
@@ -135,6 +135,6 @@ def load_voice_config(path: str | Path | None = None) -> VoiceConfig:
         beam_size=int(_get(parser, "voice", "beam_size", "5")),
         target=_get(parser, "voice", "target", "active"),
         min_seconds=float(_get(parser, "voice", "min_seconds", "0.3")),
-        max_seconds=float(_get(parser, "voice", "max_seconds", "30")),
+        max_seconds=float(_get(parser, "voice", "max_seconds", "300")),
         download_root=_get(parser, "voice", "download_root", ""),
     )
