@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --ink: #1f2329;
+    --sub: #646a73;
+    --mute: #8f959e;
+    --line: #dcdfe4;
+    --card: #ffffff;
+    --bg: #f4f5f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1200px; height: 400px; background: var(--bg); overflow: hidden; }
+  body {
+    font-family: "Noto Sans CJK SC", "Noto Sans", sans-serif;
+    color: var(--ink);
+    background-image: radial-gradient(#d9dce1 1px, transparent 1px);
+    background-size: 22px 22px;
+    background-position: 11px 11px;
+    position: relative;
+  }
+  .fade {
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, var(--bg) 0%, var(--bg) 46%, rgba(244,245,247,0.55) 70%, rgba(244,245,247,0.2) 100%);
+  }
+  .left { position: absolute; left: 72px; top: 74px; width: 560px; }
+  .eyebrow { font: 600 13px/1 "Noto Sans", sans-serif; letter-spacing: 0.22em; color: var(--mute); }
+  h1 { margin-top: 18px; font: 700 66px/1 "Noto Sans", sans-serif; letter-spacing: -0.03em; }
+  h1 span { color: var(--mute); font-weight: 400; }
+  .tag { margin-top: 22px; font-size: 27px; font-weight: 500; letter-spacing: 0.01em; }
+  .sub { margin-top: 12px; font-size: 16px; line-height: 1.7; color: var(--sub); }
+  .chips { margin-top: 26px; display: flex; gap: 10px; }
+  .chip {
+    font-size: 13px; color: var(--sub); background: var(--card);
+    border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px;
+  }
+
+  .stage { position: absolute; left: 640px; top: 0; width: 560px; height: 400px; }
+  svg.wires { position: absolute; inset: 0; }
+
+  .host {
+    position: absolute; left: 40px; top: 148px; width: 150px; height: 104px;
+    background: var(--ink); border-radius: 16px; color: #fff;
+    box-shadow: 0 14px 30px rgba(15, 23, 42, 0.18);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  }
+  .host .label { font-size: 14px; font-weight: 500; }
+  .host .hint { font-size: 11px; color: #9aa1ab; margin-top: -6px; }
+  .bars { display: flex; gap: 4px; align-items: center; height: 22px; }
+  .bars i { display: block; width: 4px; border-radius: 2px; background: #fff; }
+
+  .screen { position: absolute; width: 150px; }
+  .screen .panel {
+    height: 70px; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+    padding: 12px 12px; position: relative;
+  }
+  .screen .stand { width: 34px; height: 9px; margin: 0 auto; background: #e3e6ea; border-radius: 0 0 4px 4px; }
+  .screen .os { margin-top: 8px; text-align: center; font-size: 12px; color: var(--mute); }
+  .screen .ln { height: 6px; border-radius: 3px; background: #edf0f3; margin-bottom: 8px; }
+  .screen.active .panel { border: 1.5px solid var(--ink); box-shadow: 0 10px 26px rgba(15, 23, 42, 0.14); }
+  .screen.active .os { color: var(--ink); font-weight: 500; }
+  .caret { display: inline-block; width: 2px; height: 12px; background: var(--ink); vertical-align: -1px; margin-left: 2px; }
+  .typed { font-size: 11px; color: var(--ink); white-space: nowrap; }
+
+  .hud {
+    position: absolute; left: 330px; top: 44px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 9px;
+    box-shadow: 0 8px 22px rgba(15, 23, 42, 0.12);
+    padding: 7px 12px; font-size: 13px; display: flex; align-items: center; gap: 8px; white-space: nowrap;
+  }
+  .hud .bars { height: 14px; gap: 2.5px; }
+  .hud .bars i { width: 3px; background: #4e5969; }
+  .hud .tail { color: var(--mute); }
+  .pointer { position: absolute; }
+</style>
+</head>
+<body>
+  <div class="fade"></div>
+
+  <div class="left">
+    <div class="eyebrow">MULTI-HOST VOICE INPUT</div>
+    <h1>voice<span>-</span>tunnel</h1>
+    <div class="tag">一支麦克风，给所有电脑打字。</div>
+    <div class="sub">按住说话，文字在浮窗里逐字浮现；松手，落在鼠标所在那台机器的光标处。</div>
+    <div class="chips">
+      <span class="chip">Qwen3-ASR 流式识别</span>
+      <span class="chip">中英混说</span>
+      <span class="chip">Ubuntu · Windows</span>
+    </div>
+  </div>
+
+  <div class="stage">
+    <svg class="wires" width="560" height="400" viewBox="0 0 560 400" fill="none">
+      <path d="M190 186 C 250 186, 250 76, 308 76" stroke="#1f2329" stroke-width="1.6"/>
+      <path d="M190 200 C 250 200, 250 192, 308 192" stroke="#c4c9d0" stroke-width="1.4" stroke-dasharray="4 5"/>
+      <path d="M190 214 C 250 214, 250 308, 308 308" stroke="#c4c9d0" stroke-width="1.4" stroke-dasharray="4 5"/>
+      <circle cx="308" cy="76" r="3.5" fill="#1f2329"/>
+      <circle cx="308" cy="192" r="3" fill="#c4c9d0"/>
+      <circle cx="308" cy="308" r="3" fill="#c4c9d0"/>
+    </svg>
+
+    <div class="host">
+      <svg width="22" height="30" viewBox="0 0 22 30" fill="none">
+        <rect x="6" y="1" width="10" height="17" rx="5" fill="#fff"/>
+        <path d="M2 13.5a9 9 0 0 0 18 0" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+        <path d="M11 23v5M7 28h8" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <div class="label">语音主机</div>
+      <div class="hint">按键 · 识别 · 分发</div>
+    </div>
+
+    <div class="screen active" style="left:318px; top:34px;">
+      <div class="panel">
+        <div class="ln" style="width:70%"></div>
+        <div class="typed">› <span class="caret"></span></div>
+      </div>
+      <div class="stand"></div>
+      <div class="os">Ubuntu · 工作站</div>
+    </div>
+    <div class="hud" style="left:338px; top:82px;">
+      <span class="bars"><i style="height:8px"></i><i style="height:14px"></i><i style="height:10px"></i></span>
+      <span>把返回值改成 data<span class="tail">class</span></span>
+    </div>
+
+    <div class="screen" style="left:318px; top:150px;">
+      <div class="panel">
+        <div class="ln" style="width:60%"></div>
+        <div class="ln" style="width:82%"></div>
+      </div>
+      <div class="stand"></div>
+      <div class="os">Ubuntu · 笔记本</div>
+    </div>
+
+    <div class="screen" style="left:318px; top:266px;">
+      <div class="panel">
+        <div class="ln" style="width:76%"></div>
+        <div class="ln" style="width:48%"></div>
+      </div>
+      <div class="stand"></div>
+      <div class="os">Windows · 游戏本</div>
+    </div>
+  </div>
+</body>
+</html>
