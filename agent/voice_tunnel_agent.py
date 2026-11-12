@@ -54,7 +54,9 @@ class Options:
     dry_run: bool = False
     allow_clipboard_fallback: bool = False
     inject_mode: str = "auto"
-    terminal_classes: str = "gnome-terminal-server,gnome-terminal,konsole,xterm,alacritty,kitty,wezterm,terminator,tilix"
+    # 按子串匹配窗口类名（WM_CLASS）。"terminal" 覆盖 gnome-terminal、xfce4-terminal 等，
+    # 以及经 x-terminal-emulator 启动、类名随启动名变成 x-terminal-emulator 的 terminator
+    terminal_classes: str = "terminal,terminator,konsole,xterm,alacritty,kitty,wezterm,tilix,urxvt,foot"
     font: str = ""
     offset_x: int = 18
     offset_y: int = 22
@@ -85,7 +87,7 @@ def load_options(args: argparse.Namespace) -> Options:
         hud=_cfg_bool(parser, "agent", "hud", True),
         allow_clipboard_fallback=_cfg_bool(parser, "agent", "allow_clipboard_fallback", False),
         inject_mode=_cfg_get(parser, "agent", "inject_mode", "auto"),
-        terminal_classes=_cfg_get(parser, "agent", "terminal_classes", "gnome-terminal-server,gnome-terminal,konsole,xterm,alacritty,kitty,wezterm,terminator,tilix"),
+        terminal_classes=_cfg_get(parser, "agent", "terminal_classes", "terminal,terminator,konsole,xterm,alacritty,kitty,wezterm,tilix,urxvt,foot"),
         font=_cfg_get(parser, "hud", "font_linux" if os.name != "nt" else "font_windows", default_font),
         offset_x=int(_cfg_get(parser, "hud", "offset_x", "18")),
         offset_y=int(_cfg_get(parser, "hud", "offset_y", "22")),
