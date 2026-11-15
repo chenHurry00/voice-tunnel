@@ -119,6 +119,7 @@ class AudioRecorder:
         self.stream: Any = None
         self.capture_rate = config.sample_rate
         self.lock = threading.Lock()
+        self.fallback = False  # 配置的麦克风不可用、正在用系统默认输入
 
     def _device_index(self) -> int | None:
         import sounddevice as sd
@@ -150,33 +151,86 @@ class AudioRecorder:
         with self.lock:
             return max(self.levels[-8:]) if self.levels else 0.0
 
-    def start(self) -> None:
+    @staticmethod
+    def _rescan() -> None:
+        """重新枚举音频设备：PortAudio 只在初始化时枚举一次，热插拔/被独占后列表会过期。"""
         import sounddevice as sd
 
-        device = self._device_index()
+        sd._terminate()
+        sd._initialize()
+
+    def _open(self, device: int | None) -> Any:
+        """依次尝试各采样率打开并启动输入流。"""
+        import sounddevice as sd
+
         errors: list[str] = []
-        for rate in (self.config.sample_rate, 48000, 44100):
+        # 上次成功的采样率优先：避免每次按键都先撞一次不支持的 16k（PortAudio 会往 stderr 刷错误）
+        for rate in dict.fromkeys((self.capture_rate, self.config.sample_rate, 48000, 44100)):
             try:
-                sd.check_input_settings(
-                    device=device, channels=self.config.channels, dtype="int16", samplerate=rate
+                stream = sd.InputStream(
+                    device=device,
+                    channels=self.config.channels,
+                    dtype="int16",
+                    samplerate=rate,
+                    callback=self._callback,
                 )
-                self.capture_rate = rate
-                break
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{rate}: {exc}")
-        else:
-            raise RuntimeError("no supported input sample rate: " + "; ".join(errors))
+                continue
+            try:
+                stream.start()
+            except Exception as exc:  # noqa: BLE001
+                stream.close()
+                errors.append(f"{rate}: {exc}")
+                continue
+            self.capture_rate = rate
+            return stream
+        raise RuntimeError("no supported input sample rate: " + "; ".join(errors))
+
+    def _open_configured(self) -> tuple[Any, int]:
+        device = self._device_index()
+        if device is None:
+            raise RuntimeError(f"input device not found: {self.config.device}")
+        return self._open(device), device
+
+    def _select(self) -> tuple[Any, int | None]:
+        """配置的麦克风优先；打不开（拔出、被其他程序独占）就用系统默认输入，恢复后自动切回。"""
+        if not self.config.device.strip():
+            return self._open(None), None
+        reason = ""
+        try:
+            if self.fallback:
+                self._rescan()  # 回退中：每次按键重新枚举，配置的设备回来就切回
+            stream, device = self._open_configured()
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc)
+            if not self.fallback:
+                self._rescan()  # 首次失败：设备列表可能已过期，重新枚举再试一次
+                try:
+                    stream, device = self._open_configured()
+                except Exception as retry_exc:  # noqa: BLE001
+                    reason = str(retry_exc)
+                else:
+                    reason = ""
+        if not reason:
+            if self.fallback:
+                LOG.info("input device %r is back, switched from system default", self.config.device)
+            self.fallback = False
+            return stream, device
+        try:
+            stream = self._open(None)  # 默认输入也打不开才算失败
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"{self.config.device!r}: {reason}; system default: {exc}") from exc
+        if not self.fallback:
+            LOG.warning("input device %r unavailable (%s); using system default input", self.config.device, reason)
+        self.fallback = True
+        return stream, None
+
+    def start(self) -> None:
         with self.lock:
             self.frames = []
             self.levels = []
-        self.stream = sd.InputStream(
-            device=device,
-            channels=self.config.channels,
-            dtype="int16",
-            samplerate=self.capture_rate,
-            callback=self._callback,
-        )
-        self.stream.start()
+        self.stream, device = self._select()
         LOG.info("recording at %s Hz (device=%s)", self.capture_rate, device if device is not None else "default")
 
     def _resample(self, audio: Any) -> Any:
@@ -588,6 +642,8 @@ class VoiceListener:
         except Exception as exc:  # noqa: BLE001
             self.recording = False
             LOG.error("recording start failed: %s", exc)
+            # 放后台：解析目标要访问服务端（最长 3s），不能卡住按键线程
+            threading.Thread(target=self._mic_error_hud, daemon=True, name="mic-error").start()
             return
         self.session_stop = threading.Event()
         self.session_thread = threading.Thread(target=self._session_loop, daemon=True, name="ptt-session")
@@ -596,6 +652,9 @@ class VoiceListener:
             self.max_timer = threading.Timer(self.config.max_seconds, self._auto_stop)
             self.max_timer.daemon = True
             self.max_timer.start()
+
+    def _mic_error_hud(self) -> None:
+        self._hud("error", target=self._resolve_target(), text="麦克风不可用")
 
     def _auto_stop(self) -> None:
         if self.recording:
