@@ -38,6 +38,7 @@
 - 修复上下文复述：静音/底噪/开口前，模型会把 `context` 原样当识别结果吐出（浮窗一开始显示提示词），且会被当作前缀污染后续解码；服务端 `echoes_context` 统一拦截（流式解码、停顿/松手 refresh、整段识别），命中即清空结果和前缀；测试覆盖 3 项
 - 修复自动拉起（`ensure_qwen_service`）：权重检查支持分片（`model.safetensors.index.json`），1.7B 不再被悄悄换回 0.6B，GUI 模型列表也能列出 1.7B；vLLM 显存占比改为 config 的 `qwen_gpu_memory_utilization`（默认 0.75）；实测停掉服务后由监听端拉起，加载 1.7B 约 60s；5 项测试
 - 麦克风容错：配置的输入设备打不开（拔出，或被 PulseAudio 独占：例如 GNOME 设置的声音面板在显示电平，此时 PortAudio 枚举不到该设备、直接打开报 `Device unavailable -9985`）时，重新枚举设备再试，仍失败就回退到系统默认输入（经 PulseAudio 共享）；回退期间每次按键重新枚举，设备恢复后自动切回。全部失败时目标机浮窗提示“麦克风不可用”。上次成功的采样率优先尝试，避免每次按键刷 PortAudio 错误。真机复现（parecord 占住麦克风）验证回退与切回；4 项测试
+- Windows 切屏闪窗：Deskflow 用 `QProcess::startDetached` 启动 enter/exit 命令，`curl.exe` 是控制台程序，每次鼠标进出都会弹出控制台窗口约 20–40ms。新增 `agent/windows/deskflow_hook.cs`（GUI 子系统，用系统自带 csc 编译），README 的切屏命令补上 token（改过默认 token 后不带会 403）。OMEN 已换用并验证事件正常
 - 16 句真实口述（主机名、端口、IP、型号、术语）对比：0.6B 无上下文 → 1.7B + 通用描述 + 自动设备名 + ITN，设备名、IP、端口、数字类错误基本消除；仍错的是上下文里没有的生僻词（vLLM 大小写、KV cache、Deskflow、Qwen3 念成“千问三”），需要后续的 LLM 整句改写
 
 ## 下一步

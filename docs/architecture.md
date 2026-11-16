@@ -57,7 +57,7 @@ PTT evdev 按键按住/松开
 
 ## active_target 状态机
 
-Deskflow 的 `enterCommand` / `exitCommand` 在**被进入/离开的机器**上执行（Flatpak 沙箱内可直接 `curl`）。事件链：
+Deskflow 的 `enterCommand` / `exitCommand` 在**被进入/离开的机器**上执行（Flatpak 沙箱内可直接 `curl`）。Deskflow 用 `QProcess::startDetached` 直接启动命令（不经 shell、不等待退出），所以 Windows 上要用 GUI 子系统的 `agent/windows/deskflow_hook.cs`，否则控制台程序会闪出黑窗。事件链：
 
 ```text
 Deskflow 切屏

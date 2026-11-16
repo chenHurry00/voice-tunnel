@@ -141,8 +141,23 @@ python3 agent/voice_tunnel_agent.py --config config.ini --host <本机名>
 **4. Deskflow**：在每台机器的屏幕设置里填上切屏命令
 
 ```text
-enterCommand  curl -X POST 'http://127.0.0.1:8766/active?state=enter'
-exitCommand   curl -X POST 'http://127.0.0.1:8766/active?state=leave'
+enterCommand  curl -X POST 'http://127.0.0.1:8766/active?state=enter&token=<token>'
+exitCommand   curl -X POST 'http://127.0.0.1:8766/active?state=leave&token=<token>'
+```
+
+`<token>` 与 `config.ini` 里的 `token` 一致（仍是默认值 `change-me` 时可省略），否则 Agent 返回 403、切屏不生效。
+
+Windows 上不要用 `curl.exe`：它是控制台程序，每次鼠标进出都会闪一下黑窗。改用 [agent/windows/deskflow_hook.cs](agent/windows/deskflow_hook.cs) 编译出的无窗口程序。在仓库根目录用 PowerShell 构建（编译器是 Windows 10/11 自带的 .NET Framework 4，无需安装）：
+
+```powershell
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /out:hook.exe agent\windows\deskflow_hook.cs
+```
+
+然后在 Deskflow 里填（路径含空格时用双引号括起 exe 路径）：
+
+```text
+enterCommand  C:/path/to/hook.exe http://127.0.0.1:8766/active?state=enter&token=<token>
+exitCommand   C:/path/to/hook.exe http://127.0.0.1:8766/active?state=leave&token=<token>
 ```
 
 不接麦克风也能先把链路跑通：
